@@ -11,6 +11,13 @@ load_dotenv()
 DEFAULT_DATABASE_PATH = str(Path(__file__).resolve().parents[1] / "data" / "app.db")
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     database_path: str = getenv("DATABASE_PATH") or DEFAULT_DATABASE_PATH
@@ -23,6 +30,12 @@ class Settings:
     ).rstrip("/")
     omni_model: str = getenv("OMNI_MODEL", "qwen3.5-omni-plus")
     omni_chat_model: str = getenv("OMNI_CHAT_MODEL", "")
+    omni_realtime_enabled: bool = env_bool("OMNI_REALTIME_ENABLED", False)
+    omni_realtime_base_url: str = getenv(
+        "OMNI_REALTIME_BASE_URL", "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+    ).rstrip("/")
+    omni_realtime_model: str = getenv("OMNI_REALTIME_MODEL", "qwen3-omni-flash-realtime")
+    omni_realtime_voice: str = getenv("OMNI_REALTIME_VOICE", "Cherry")
     vision_api_key: str = getenv("VISION_API_KEY", "")
     vision_base_url: str = getenv(
         "VISION_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
