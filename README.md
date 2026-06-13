@@ -24,11 +24,30 @@
 Backend:
 
 ```bash
+make backend
+```
+
+This creates `backend/.venv` if needed, installs backend dependencies, and
+starts FastAPI on `http://localhost:8000`. To override the host or port:
+
+```bash
+BACKEND_HOST=127.0.0.1 BACKEND_PORT=9000 make backend
+```
+
+Dependencies are installed only when `backend/.venv` is missing or
+`backend/requirements.txt` changes. To force reinstall:
+
+```bash
+make backend-reinstall
+```
+
+Manual backend startup is still available:
+
+```bash
 cd backend
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m uvicorn app.main:app --reload --port 8000
 ```
 
 Pipecat native modules require Python 3.10+. If you run on Python 3.9, the app
