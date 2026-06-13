@@ -1,6 +1,6 @@
 # AI Vision Conversation Assistant
 
-混合流式 AI 视觉对话助手。它不是把连续视频直接丢给一体化实时模型，而是用自建 WebSocket Gateway 编排音频流、语音转写、视觉关键帧、流式 LLM、TTS 和成本控制。
+混合流式 AI 视觉对话助手。它用自建 WebSocket Gateway 编排音频流、语音转写、视觉关键帧、多模态模型直答、TTS 和成本控制。
 
 ## Architecture
 
@@ -9,13 +9,13 @@
   - 麦克风 AudioWorklet PCM 分片
   - Web Speech API 低成本 ASR 兜底
   - 关键帧抽取、画面变化检测
-  - LLM 流式文本展示
+  - 多模态模型流式文本展示
   - 浏览器 SpeechSynthesis 准流式 TTS
 - `backend`: FastAPI + WebSocket + Pipecat-compatible conversation pipeline
   - 自建 Gateway 长连接
   - 流式事件协议
-  - Pipecat-ready 对话 pipeline，集中处理 LLM streaming、TTS chunk、history 和 cancel
-  - OpenAI-compatible LLM/VL 适配
+  - Pipecat-ready 对话 pipeline，集中处理模型 streaming、TTS chunk、history 和 cancel
+  - OpenAI-compatible Omni/VL 直答适配
   - mock fallback，未配置 API Key 也可演示
   - 会话级成本统计、缓存命中、打断取消
 
@@ -73,10 +73,6 @@ http://localhost:5173
 Copy `.env.example` to `backend/.env` or export the variables before starting the backend.
 
 ```bash
-export LLM_API_KEY="..."
-export LLM_BASE_URL="https://api.deepseek.com"
-export LLM_MODEL="deepseek-chat"
-
 export OMNI_API_KEY="..."
 export OMNI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
 export OMNI_MODEL="qwen3.5-omni-plus"
@@ -90,13 +86,12 @@ export VISION_MODEL="qwen-vl-plus"
 
 If these are not set, the backend uses local mock streaming so the protocol and UI remain fully testable.
 
-When `OMNI_API_KEY` is configured, text and visual turns use Qwen-Omni directly:
-the Gateway buffers recent camera keyframes in memory and the conversation
-pipeline sends the latest original frame plus the user question to Qwen-Omni.
-This avoids the older summary bottleneck where a separate vision model first
-compresses the image into text and the dialogue model answers from that lossy
-summary. The Qwen-VL summary path remains available as a fallback when Omni is
-not configured.
+When `OMNI_API_KEY` is configured, text and visual turns use Qwen-Omni directly.
+If only `VISION_API_KEY` is configured, visual turns use the configured VL model
+directly. In both paths, the Gateway buffers recent camera keyframes in memory
+and the conversation pipeline sends the latest original frame plus the user
+question to the model. There is no intermediate visual-summary-plus-text-model
+pipeline.
 
 This code path uses the OpenAI-compatible Chat Completions API. Do not set
 `OMNI_MODEL` to a `*-realtime` model unless you also implement the separate
@@ -112,8 +107,8 @@ export DATABASE_PATH="backend/data/app.db"
 ```
 
 The SQLite store keeps users, conversation metadata, text messages, cost
-snapshots, and the latest visual summary. It does not store raw audio,
-continuous video, or camera keyframe images.
+snapshots, and account/session state. It does not store raw audio, continuous
+video, or camera keyframe images.
 
 ## Streaming Events
 
@@ -131,7 +126,7 @@ Gateway to Client:
 - `session.ready`
 - `asr.partial`
 - `asr.final`
-- `vision.summary`
+- `vision.frame.cached`
 - `llm.delta`
 - `llm.done`
 - `tts.audio.chunk`
@@ -145,7 +140,7 @@ The backend conversation logic now lives in `backend/app/conversation_pipeline.p
 The WebSocket Gateway is only responsible for transport and session events;
 the pipeline owns:
 
-- LLM token streaming
+- direct multimodal/VL token streaming
 - sentence-level TTS chunking
 - assistant history updates
 - cost snapshots

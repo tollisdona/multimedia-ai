@@ -235,16 +235,6 @@ def save_cost_snapshot(user_id: str, conversation_id: str, snapshot: dict[str, A
         )
 
 
-def save_vision_summary(user_id: str, conversation_id: str, summary: dict[str, Any]) -> None:
-    summary_json = json.dumps(summary, ensure_ascii=False)
-    now = now_ms()
-    with connect() as connection:
-        connection.execute(
-            "UPDATE conversations SET latest_vision_json = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-            (summary_json, now, conversation_id, user_id),
-        )
-
-
 def touch_conversation(connection: sqlite3.Connection, user_id: str, conversation_id: str, updated_at: int) -> None:
     connection.execute(
         "UPDATE conversations SET updated_at = ? WHERE id = ? AND user_id = ?",
@@ -254,6 +244,6 @@ def touch_conversation(connection: sqlite3.Connection, user_id: str, conversatio
 
 def decorate_conversation(conversation: dict[str, Any]) -> dict[str, Any]:
     conversation["message_count"] = int(conversation.get("message_count") or 0)
-    conversation["latest_vision"] = json.loads(conversation.pop("latest_vision_json", "{}") or "{}")
+    conversation.pop("latest_vision_json", None)
     conversation["latest_cost"] = json.loads(conversation.pop("latest_cost_json", "{}") or "{}")
     return conversation

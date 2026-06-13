@@ -22,7 +22,6 @@ class ConversationOut(BaseModel):
     createdAt: int
     updatedAt: int
     messageCount: int
-    latestVision: dict[str, Any]
     latestCost: dict[str, Any]
 
 
@@ -40,7 +39,6 @@ def public_conversation(conversation: dict[str, Any]) -> ConversationOut:
         createdAt=int(conversation["created_at"]),
         updatedAt=int(conversation["updated_at"]),
         messageCount=int(conversation["message_count"]),
-        latestVision=dict(conversation["latest_vision"]),
         latestCost=dict(conversation["latest_cost"]),
     )
 

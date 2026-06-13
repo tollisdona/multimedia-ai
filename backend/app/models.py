@@ -48,17 +48,6 @@ class CostState:
 
 
 @dataclass
-class VisionSummary:
-    summary: str = "还没有视觉摘要。"
-    objects: list[str] = field(default_factory=list)
-    text_seen: str = ""
-    confidence: float = 0.0
-    frame_hash: str = ""
-    updated_at: int = 0
-    source: str = "none"
-
-
-@dataclass
 class FrameSnapshot:
     data_url: str
     reason: str
@@ -73,7 +62,6 @@ class SessionState:
     conversation_id: str = ""
     created_at: int = field(default_factory=now_ms)
     latest_transcript: str = ""
-    latest_vision: VisionSummary = field(default_factory=VisionSummary)
     recent_frames: list[FrameSnapshot] = field(default_factory=list)
     history: list[dict[str, str]] = field(default_factory=list)
     cost: CostState = field(default_factory=CostState)

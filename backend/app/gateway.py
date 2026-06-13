@@ -7,11 +7,10 @@ from typing import Any
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from .ai import analyze_vision, frame_hash
-from .config import settings
+from .ai import frame_hash
 from .conversation_pipeline import ConversationPipeline, pipecat_runtime_status
-from .db import append_message, save_cost_snapshot, save_vision_summary
-from .models import FrameSnapshot, SessionState, VisionSummary, event, now_ms
+from .db import append_message, save_cost_snapshot
+from .models import FrameSnapshot, SessionState, event, now_ms
 
 
 class GatewayConnection:
@@ -39,9 +38,9 @@ class GatewayConnection:
             capabilities={
                 "audioInput": "pcm16-json-chunks",
                 "asr": "browser-fallback-through-gateway",
-                "llm": "qwen-omni-direct-frame-stream-or-openai-compatible-fallback",
+                "llm": "direct-multimodal-frame-answer-stream-or-mock",
                 "tts": "browser-speech-synthesis",
-                "vision": "keyframe-buffer-qwen-omni-direct-or-vl-summary-fallback",
+                "vision": "keyframe-buffer-direct-answer-no-summary",
                 "pipeline": pipecat_runtime_status(),
             },
         )
@@ -98,81 +97,21 @@ class GatewayConnection:
             return
 
         image_hash = frame_hash(data_url)
-        self.session.recent_frames.append(
-            FrameSnapshot(data_url=data_url, reason=reason, frame_hash=image_hash, captured_at=now_ms())
-        )
-        self.session.recent_frames = self.session.recent_frames[-4:]
-
-        if settings.omni_api_key:
-            summary = VisionSummary(
-                summary="已缓存当前摄像头关键帧。下一轮视觉相关回答会将原始图像直接交给 Qwen-Omni 分析，而不是只依赖文字摘要。",
-                objects=[],
-                text_seen="",
-                confidence=0.9,
-                frame_hash=image_hash,
-                updated_at=now_ms(),
-                source=f"{settings.resolved_omni_chat_model}-frame-buffer",
-            )
-            self.session.latest_vision = summary
-            save_vision_summary(
-                self.session.user_id,
-                self.session.conversation_id,
-                {
-                    "summary": summary.summary,
-                    "objects": summary.objects,
-                    "textSeen": summary.text_seen,
-                    "confidence": summary.confidence,
-                    "source": summary.source,
-                    "reason": reason,
-                },
-            )
-            await self.send(
-                "vision.summary",
-                summary=summary.summary,
-                objects=summary.objects,
-                textSeen=summary.text_seen,
-                confidence=summary.confidence,
-                source=summary.source,
-                reason=reason,
-            )
-            await self.send_cost()
-            return
-
-        previous_hash = self.session.latest_vision.frame_hash
-        try:
-            summary = await analyze_vision(data_url, reason, previous_hash)
-        except Exception as exc:
-            await self.send("error", code="vision_failed", message=str(exc))
-            return
-        if summary.source == "cache":
+        reused = bool(self.session.recent_frames and self.session.recent_frames[-1].frame_hash == image_hash)
+        if reused:
             self.session.cost.vision_cache_hits += 1
-            summary.summary = self.session.latest_vision.summary
-            summary.objects = self.session.latest_vision.objects
-            summary.text_seen = self.session.latest_vision.text_seen
-            summary.confidence = max(summary.confidence, self.session.latest_vision.confidence)
         else:
-            self.session.cost.vision_frames += 1
-        self.session.latest_vision = summary
-        save_vision_summary(
-            self.session.user_id,
-            self.session.conversation_id,
-            {
-                "summary": summary.summary,
-                "objects": summary.objects,
-                "textSeen": summary.text_seen,
-                "confidence": summary.confidence,
-                "source": summary.source,
-                "reason": reason,
-            },
-        )
+            self.session.recent_frames.append(
+                FrameSnapshot(data_url=data_url, reason=reason, frame_hash=image_hash, captured_at=now_ms())
+            )
+            self.session.recent_frames = self.session.recent_frames[-4:]
+
         await self.send(
-            "vision.summary",
-            summary=summary.summary,
-            objects=summary.objects,
-            textSeen=summary.text_seen,
-            confidence=summary.confidence,
-            source=summary.source,
+            "vision.frame.cached",
             reason=reason,
+            frameHash=image_hash,
+            reused=reused,
+            bufferedFrames=len(self.session.recent_frames),
         )
         await self.send_cost()
 

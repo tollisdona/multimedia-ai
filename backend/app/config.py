@@ -17,9 +17,6 @@ class Settings:
     jwt_secret_key: str = getenv("JWT_SECRET_KEY", "dev-only-change-me")
     jwt_algorithm: str = getenv("JWT_ALGORITHM", "HS256")
     access_token_minutes: int = int(getenv("ACCESS_TOKEN_MINUTES", "10080"))
-    llm_api_key: str = getenv("LLM_API_KEY", "")
-    llm_base_url: str = getenv("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
-    llm_model: str = getenv("LLM_MODEL", "deepseek-chat")
     omni_api_key: str = getenv("OMNI_API_KEY", "") or getenv("DASHSCOPE_API_KEY", "")
     omni_base_url: str = getenv(
         "OMNI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"

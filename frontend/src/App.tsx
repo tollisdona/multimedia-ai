@@ -35,7 +35,7 @@ import {
   type PersistedMessage,
 } from "./lib/api";
 import { GatewayClient } from "./lib/wsClient";
-import type { ChatMessage, CostSnapshot, GatewayEvent, VisionSummary } from "./types";
+import type { ChatMessage, CostSnapshot, GatewayEvent } from "./types";
 
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
 const SPEECH_AUTO_SEND_DELAY_MS = 1200;
@@ -52,15 +52,6 @@ const emptyCost: CostSnapshot = {
   ttsChars: 0,
   interruptions: 0,
   estimatedUnits: 0,
-};
-
-const initialVision: VisionSummary = {
-  summary: "等待第一帧关键画面。",
-  objects: [],
-  textSeen: "",
-  confidence: 0,
-  source: "none",
-  reason: "none",
 };
 
 type AppView = "chat" | "cost" | "settings";
@@ -123,10 +114,6 @@ function isCostSnapshot(value: unknown): value is CostSnapshot {
   return Boolean(value && typeof value === "object" && "audioSeconds" in value && "estimatedUnits" in value);
 }
 
-function isVisionSummary(value: unknown): value is VisionSummary {
-  return Boolean(value && typeof value === "object" && "summary" in value);
-}
-
 export function App() {
   const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
   const [authSession, setAuthSession] = useState<AuthSession | null>(() => loadStoredAuth());
@@ -173,7 +160,6 @@ export function App() {
   const [sessionMessages, setSessionMessages] = useState<Record<string, ChatMessage[]>>({
     [initialSessionId]: createStarterMessages(),
   });
-  const [vision, setVision] = useState<VisionSummary>(initialVision);
   const [cost, setCost] = useState<CostSnapshot>(emptyCost);
   const [manualText, setManualText] = useState("");
   const [lastError, setLastError] = useState("");
@@ -269,7 +255,6 @@ export function App() {
         setSessions(persisted.map(conversationToSession));
         const first = persisted[0];
         setCurrentSessionId(first.id);
-        setVision(isVisionSummary(first.latestVision) ? first.latestVision : initialVision);
         setCost(isCostSnapshot(first.latestCost) ? first.latestCost : emptyCost);
         await loadConversation(first.id, authSession.accessToken);
         if (active) setConversationsLoaded(true);
@@ -517,17 +502,6 @@ export function App() {
           ),
         );
         beginAssistantResponse();
-      }
-      if (event.type === "vision.summary") {
-        setAiState((current) => (current === "speaking" ? current : "processing"));
-        setVision({
-          summary: event.summary,
-          objects: event.objects,
-          textSeen: event.textSeen,
-          confidence: event.confidence,
-          source: event.source,
-          reason: event.reason,
-        });
       }
       if (event.type === "llm.delta") {
         setAiState((current) => (current === "speaking" ? current : "processing"));
@@ -795,7 +769,6 @@ export function App() {
     setCurrentSessionId(conversation.id);
     setPartial("");
     setManualText("");
-    setVision(initialVision);
     setCost(emptyCost);
     setActiveView("chat");
   }, [apiBaseUrl, authSession?.accessToken, cancel, stopSession]);
@@ -1412,7 +1385,7 @@ function CostStation({ cost, connectionState, permissionStatus, asrStatus }: { c
         <div className="mt-2 flex items-end justify-between gap-4">
           <div>
             <h2 className="text-3xl font-black">模型消耗中转站</h2>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">集中观察 ASR、视觉关键帧、LLM token、TTS 字符和缓存命中。</p>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">集中观察 ASR、视觉关键帧、模型 token、TTS 字符和缓存命中。</p>
           </div>
           <strong className="text-6xl font-black">{cost.estimatedUnits}</strong>
         </div>
@@ -1432,7 +1405,7 @@ function CostStation({ cost, connectionState, permissionStatus, asrStatus }: { c
         <PipelineItem icon={<Wifi size={16} />} label={`Gateway：${connectionState}`} />
         <PipelineItem icon={<Camera size={16} />} label={`权限：${permissionStatus}`} />
         <PipelineItem icon={<Mic size={16} />} label={`ASR：${asrStatus}`} />
-        <PipelineItem icon={<Eye size={16} />} label="Keyframe VL" />
+        <PipelineItem icon={<Eye size={16} />} label="Direct Omni/VL" />
         <PipelineItem icon={<Volume2 size={16} />} label="Browser TTS" />
       </div>
     </section>
