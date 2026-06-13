@@ -38,6 +38,8 @@ import { GatewayClient } from "./lib/wsClient";
 import type { ChatMessage, CostSnapshot, GatewayEvent, VisionSummary } from "./types";
 
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
+const SPEECH_AUTO_SEND_DELAY_MS = 1200;
+const DUPLICATE_SPEECH_WINDOW_MS = 1800;
 
 const emptyCost: CostSnapshot = {
   audioSeconds: 0,
@@ -152,6 +154,9 @@ export function App() {
   const recognitionDisabledRef = useRef(false);
   const recognitionRestartTimerRef = useRef(0);
   const recognitionStarterRef = useRef<() => void>(() => {});
+  const pendingSpeechRef = useRef("");
+  const pendingSpeechTimerRef = useRef(0);
+  const lastSubmittedSpeechRef = useRef<{ text: string; at: number } | null>(null);
   const lastSampleRef = useRef<Uint8ClampedArray | null>(null);
   const lastVisionAtRef = useRef(0);
   const runningRef = useRef(false);
@@ -335,6 +340,12 @@ export function App() {
     }
   }, [setMessages]);
 
+  const clearPendingSpeech = useCallback(() => {
+    pendingSpeechRef.current = "";
+    window.clearTimeout(pendingSpeechTimerRef.current);
+    setPartial("");
+  }, []);
+
   const processTtsQueue = useCallback(() => {
     if (ttsPlayingRef.current) return;
     const next = ttsQueueRef.current.shift();
@@ -348,6 +359,7 @@ export function App() {
       return;
     }
     recognitionPausedForTtsRef.current = true;
+    clearPendingSpeech();
     try {
       recognitionRef.current?.stop?.();
     } catch {
@@ -368,7 +380,7 @@ export function App() {
       processTtsQueue();
     };
     window.speechSynthesis.speak(utterance);
-  }, []);
+  }, [clearPendingSpeech]);
 
   const enqueueSpeech = useCallback(
     (text: string) => {
@@ -443,6 +455,45 @@ export function App() {
       client.send("browser.asr.final", { text: clean });
     },
     [captureFrame, client, finishAssistant, stopSpeech],
+  );
+
+  const submitRecognizedSpeech = useCallback(
+    (text: string) => {
+      const clean = text.trim();
+      if (!clean || !runningRef.current || recognitionPausedForTtsRef.current || recognitionDisabledRef.current) return;
+
+      const now = Date.now();
+      const lastSubmitted = lastSubmittedSpeechRef.current;
+      if (
+        lastSubmitted &&
+        lastSubmitted.text === clean &&
+        now - lastSubmitted.at < DUPLICATE_SPEECH_WINDOW_MS
+      ) {
+        clearPendingSpeech();
+        return;
+      }
+
+      lastSubmittedSpeechRef.current = { text: clean, at: now };
+      clearPendingSpeech();
+      void sendFinalTranscript(clean);
+    },
+    [clearPendingSpeech, sendFinalTranscript],
+  );
+
+  const scheduleRecognizedSpeech = useCallback(
+    (text: string) => {
+      const clean = text.trim();
+      if (!clean || recognitionPausedForTtsRef.current || recognitionDisabledRef.current) return;
+
+      pendingSpeechRef.current = clean;
+      window.clearTimeout(pendingSpeechTimerRef.current);
+      pendingSpeechTimerRef.current = window.setTimeout(() => {
+        const pending = pendingSpeechRef.current.trim();
+        if (!pending || !runningRef.current || recognitionPausedForTtsRef.current || recognitionDisabledRef.current) return;
+        submitRecognizedSpeech(pending);
+      }, SPEECH_AUTO_SEND_DELAY_MS);
+    },
+    [submitRecognizedSpeech],
   );
 
   const handleGatewayEvent = useCallback(
@@ -560,6 +611,7 @@ export function App() {
     recognition.interimResults = true;
     setAsrStatus("浏览器 ASR 运行中");
     recognition.onresult = (event: any) => {
+      if (!runningRef.current || recognitionPausedForTtsRef.current || recognitionDisabledRef.current) return;
       let interim = "";
       let finalText = "";
       for (let i = event.resultIndex; i < event.results.length; i += 1) {
@@ -567,8 +619,12 @@ export function App() {
         if (event.results[i].isFinal) finalText += transcript;
         else interim += transcript;
       }
-      if (interim.trim()) client.send("browser.asr.partial", { text: interim.trim() });
-      if (finalText.trim()) void sendFinalTranscript(finalText.trim());
+      const cleanInterim = interim.trim();
+      if (cleanInterim) {
+        client.send("browser.asr.partial", { text: cleanInterim });
+        scheduleRecognizedSpeech(cleanInterim);
+      }
+      if (finalText.trim()) submitRecognizedSpeech(finalText.trim());
     };
     recognition.onerror = (event: any) => {
       const error = event.error ?? "unknown";
@@ -600,11 +656,20 @@ export function App() {
     } catch {
       recognitionRef.current = null;
     }
-  }, [appendMessage, client, sendFinalTranscript]);
+  }, [appendMessage, client, scheduleRecognizedSpeech, submitRecognizedSpeech]);
 
   useEffect(() => {
     recognitionStarterRef.current = startSpeechRecognition;
   }, [startSpeechRecognition]);
+
+  useEffect(
+    () => () => {
+      pendingSpeechRef.current = "";
+      window.clearTimeout(pendingSpeechTimerRef.current);
+      window.clearTimeout(recognitionRestartTimerRef.current);
+    },
+    [],
+  );
 
   const startSession = useCallback(async () => {
     let grantedStream: MediaStream | null = null;
@@ -618,6 +683,7 @@ export function App() {
       setAsrStatus("准备启动");
       setSessionReady(false);
       setMediaReady(false);
+      clearPendingSpeech();
       client.close();
 
       grantedStream = await navigator.mediaDevices.getUserMedia({
@@ -662,46 +728,54 @@ export function App() {
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [captureFrame, client, conversationsLoaded, currentSessionId, startSpeechRecognition]);
+  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, startSpeechRecognition]);
 
   const stopSession = useCallback(async () => {
     runningRef.current = false;
+    clearPendingSpeech();
     ttsQueueRef.current = [];
     ttsPlayingRef.current = false;
     window.speechSynthesis?.cancel();
     window.clearTimeout(recognitionRestartTimerRef.current);
     recognitionDisabledRef.current = false;
     recognitionPausedForTtsRef.current = false;
-    recognitionRef.current?.stop?.();
+    try {
+      recognitionRef.current?.stop?.();
+    } catch {
+      // Some browsers throw if recognition has already stopped.
+    }
     recognitionRef.current = null;
     await audioCaptureRef.current?.stop();
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     audioCaptureRef.current = null;
     client.close();
+    if (assistantMessageIdRef.current) finishAssistant(true);
     setSessionReady(false);
     setMediaReady(false);
     setMediaState("stopped");
     setConnectionState("closed");
     setAsrStatus("已停止");
     setAiState("idle");
-  }, [client]);
+  }, [clearPendingSpeech, client, finishAssistant]);
 
   const sendManual = useCallback(async () => {
     const text = manualText.trim();
     if (!text) return;
     setManualText("");
+    clearPendingSpeech();
     await sendFinalTranscript(text);
-  }, [manualText, sendFinalTranscript]);
+  }, [clearPendingSpeech, manualText, sendFinalTranscript]);
 
   const cancel = useCallback(() => {
     client.send("speech.cancel", { reason: "manual" });
+    clearPendingSpeech();
     ttsQueueRef.current = [];
     ttsPlayingRef.current = false;
     window.speechSynthesis?.cancel();
     finishAssistant(true);
     setAiState(runningRef.current ? "listening" : "idle");
-  }, [client, finishAssistant]);
+  }, [clearPendingSpeech, client, finishAssistant]);
 
   const handleComposerAction = useCallback(() => {
     if (isProcessing) {
