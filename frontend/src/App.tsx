@@ -21,6 +21,7 @@ import {
   WifiOff,
 } from "lucide-react";
 import { AudioCapture } from "./lib/audioCapture";
+import { PcmStreamPlayer } from "./lib/pcmPlayer";
 import {
   createConversation,
   fetchConversationMessages,
@@ -129,6 +130,7 @@ export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sampleRef = useRef<HTMLCanvasElement | null>(null);
   const audioCaptureRef = useRef<AudioCapture | null>(null);
+  const audioPlayerRef = useRef<PcmStreamPlayer | null>(null);
   const recognitionRef = useRef<any>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const assistantMessageIdRef = useRef<string | null>(null);
@@ -146,6 +148,8 @@ export function App() {
   const lastSubmittedSpeechRef = useRef<{ text: string; at: number } | null>(null);
   const lastSampleRef = useRef<Uint8ClampedArray | null>(null);
   const lastVisionAtRef = useRef(0);
+  const realtimeAudioRef = useRef(false);
+  const modelAudioPlayingRef = useRef(false);
   const runningRef = useRef(false);
 
   const [connectionState, setConnectionState] = useState("closed");
@@ -168,6 +172,7 @@ export function App() {
   const [asrStatus, setAsrStatus] = useState("未启动");
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [aiState, setAiState] = useState<AiState>("idle");
+  const [realtimeAudio, setRealtimeAudio] = useState(false);
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [videoPanePercent, setVideoPanePercent] = useState(57.14);
   const [conversationsLoaded, setConversationsLoaded] = useState(false);
@@ -320,7 +325,7 @@ export function App() {
     assistantPlaceholderRef.current = false;
     assistantTextRef.current = "";
     assistantTextFromTtsRef.current = false;
-    if (!ttsPlayingRef.current && ttsQueueRef.current.length === 0) {
+    if (!ttsPlayingRef.current && ttsQueueRef.current.length === 0 && !modelAudioPlayingRef.current) {
       setAiState(runningRef.current ? "listening" : "idle");
     }
   }, [setMessages]);
@@ -329,6 +334,27 @@ export function App() {
     pendingSpeechRef.current = "";
     window.clearTimeout(pendingSpeechTimerRef.current);
     setPartial("");
+  }, []);
+
+  const stopModelAudio = useCallback(() => {
+    audioPlayerRef.current?.stop();
+    modelAudioPlayingRef.current = false;
+  }, []);
+
+  const ensureAudioPlayer = useCallback(() => {
+    if (!audioPlayerRef.current) {
+      audioPlayerRef.current = new PcmStreamPlayer(
+        () => {
+          modelAudioPlayingRef.current = true;
+          setAiState("speaking");
+        },
+        () => {
+          modelAudioPlayingRef.current = false;
+          if (!assistantMessageIdRef.current) setAiState(runningRef.current ? "listening" : "idle");
+        },
+      );
+    }
+    return audioPlayerRef.current;
   }, []);
 
   const processTtsQueue = useCallback(() => {
@@ -486,6 +512,18 @@ export function App() {
       if (event.type === "session.ready") {
         setConnectionState("open");
         setSessionReady(true);
+        const enabled = event.capabilities.realtime === true;
+        realtimeAudioRef.current = enabled;
+        setRealtimeAudio(enabled);
+        if (enabled) {
+          setAsrStatus("Qwen Realtime ASR");
+          try {
+            recognitionRef.current?.stop?.();
+          } catch {
+            // Ignore duplicate stop.
+          }
+          recognitionRef.current = null;
+        }
       }
       if (event.type === "asr.partial") {
         setPartial(event.text);
@@ -507,22 +545,33 @@ export function App() {
         setAiState((current) => (current === "speaking" ? current : "processing"));
         updateAssistantDelta(event.delta);
       }
+      if (event.type === "response.text.delta") {
+        setAiState((current) => (current === "speaking" ? current : "processing"));
+        updateAssistantDelta(event.delta);
+      }
+      if (event.type === "response.audio.delta") {
+        void ensureAudioPlayer().play(event.audio, event.sampleRate);
+      }
+      if (event.type === "response.audio.done") {
+        if (!modelAudioPlayingRef.current && !assistantMessageIdRef.current) setAiState(runningRef.current ? "listening" : "idle");
+      }
       if (event.type === "tts.audio.chunk") {
         if (!assistantMessageIdRef.current) beginAssistantResponse();
         if (event.text?.trim() && (assistantTextFromTtsRef.current || !assistantTextRef.current.trim())) {
           updateAssistantDelta(event.text, "tts");
         }
-        enqueueSpeech(event.text);
+        if (!realtimeAudioRef.current) enqueueSpeech(event.text);
       }
       if (event.type === "llm.done") finishAssistant(event.cancelled);
       if (event.type === "speech.cancelled") {
+        stopModelAudio();
         stopSpeech();
         finishAssistant(true);
       }
       if (event.type === "session.cost") setCost(event.cost);
       if (event.type === "error") setLastError(`${event.code}: ${event.message}`);
     },
-    [appendMessage, beginAssistantResponse, currentSessionId, enqueueSpeech, finishAssistant, stopSpeech, updateAssistantDelta],
+    [appendMessage, beginAssistantResponse, currentSessionId, enqueueSpeech, ensureAudioPlayer, finishAssistant, stopModelAudio, stopSpeech, updateAssistantDelta],
   );
 
   useEffect(() => client.on(handleGatewayEvent), [client, handleGatewayEvent]);
@@ -570,6 +619,10 @@ export function App() {
   }, [checkMediaPermissions]);
 
   const startSpeechRecognition = useCallback(() => {
+    if (realtimeAudioRef.current) {
+      setAsrStatus("Qwen Realtime ASR");
+      return;
+    }
     if (recognitionRef.current || recognitionDisabledRef.current || recognitionPausedForTtsRef.current) return;
     const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
     if (!Recognition) {
@@ -683,7 +736,8 @@ export function App() {
       runningRef.current = true;
       setAiState("listening");
       setMediaState("running");
-      startSpeechRecognition();
+      if (realtimeAudioRef.current) setAsrStatus("Qwen Realtime ASR");
+      else startSpeechRecognition();
       await captureFrame("startup", true);
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
@@ -707,6 +761,7 @@ export function App() {
   const stopSession = useCallback(async () => {
     runningRef.current = false;
     clearPendingSpeech();
+    stopModelAudio();
     ttsQueueRef.current = [];
     ttsPlayingRef.current = false;
     window.speechSynthesis?.cancel();
@@ -731,7 +786,7 @@ export function App() {
     setConnectionState("closed");
     setAsrStatus("已停止");
     setAiState("idle");
-  }, [clearPendingSpeech, client, finishAssistant]);
+  }, [clearPendingSpeech, client, finishAssistant, stopModelAudio]);
 
   const sendManual = useCallback(async () => {
     const text = manualText.trim();
@@ -744,12 +799,13 @@ export function App() {
   const cancel = useCallback(() => {
     client.send("speech.cancel", { reason: "manual" });
     clearPendingSpeech();
+    stopModelAudio();
     ttsQueueRef.current = [];
     ttsPlayingRef.current = false;
     window.speechSynthesis?.cancel();
     finishAssistant(true);
     setAiState(runningRef.current ? "listening" : "idle");
-  }, [clearPendingSpeech, client, finishAssistant]);
+  }, [clearPendingSpeech, client, finishAssistant, stopModelAudio]);
 
   const handleComposerAction = useCallback(() => {
     if (isProcessing) {
@@ -865,7 +921,7 @@ export function App() {
               />
             )}
             {activeView === "cost" && (
-              <CostStation cost={cost} connectionState={connectionState} permissionStatus={permissionStatus} asrStatus={asrStatus} />
+              <CostStation cost={cost} connectionState={connectionState} permissionStatus={permissionStatus} asrStatus={asrStatus} realtimeAudio={realtimeAudio} />
             )}
             {activeView === "settings" && (
               <SettingsView
@@ -1377,7 +1433,7 @@ function AiStatusIndicator({ state }: { state: AiState }) {
   );
 }
 
-function CostStation({ cost, connectionState, permissionStatus, asrStatus }: { cost: CostSnapshot; connectionState: string; permissionStatus: string; asrStatus: string }) {
+function CostStation({ cost, connectionState, permissionStatus, asrStatus, realtimeAudio }: { cost: CostSnapshot; connectionState: string; permissionStatus: string; asrStatus: string; realtimeAudio: boolean }) {
   return (
     <section className="space-y-6">
       <div className="rounded-[2rem] bg-slate-950 p-8 text-white shadow-soft">
@@ -1406,7 +1462,7 @@ function CostStation({ cost, connectionState, permissionStatus, asrStatus }: { c
         <PipelineItem icon={<Camera size={16} />} label={`权限：${permissionStatus}`} />
         <PipelineItem icon={<Mic size={16} />} label={`ASR：${asrStatus}`} />
         <PipelineItem icon={<Eye size={16} />} label="Direct Omni/VL" />
-        <PipelineItem icon={<Volume2 size={16} />} label="Browser TTS" />
+        <PipelineItem icon={<Volume2 size={16} />} label={realtimeAudio ? "Qwen Realtime Audio" : "Browser TTS"} />
       </div>
     </section>
   );
