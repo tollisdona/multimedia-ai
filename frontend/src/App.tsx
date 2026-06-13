@@ -35,7 +35,7 @@ import {
   type PersistedMessage,
 } from "./lib/api";
 import { GatewayClient } from "./lib/wsClient";
-import type { ChatMessage, CostSnapshot, GatewayEvent } from "./types";
+import type { ChatMessage, CostSnapshot, GatewayEvent, VadSnapshot } from "./types";
 
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
 const SPEECH_AUTO_SEND_DELAY_MS = 1200;
@@ -146,6 +146,8 @@ export function App() {
   const lastSubmittedSpeechRef = useRef<{ text: string; at: number } | null>(null);
   const lastSampleRef = useRef<Uint8ClampedArray | null>(null);
   const lastVisionAtRef = useRef(0);
+  const speechFrameCountRef = useRef(0);
+  const lastSpeechFrameAtRef = useRef(0);
   const runningRef = useRef(false);
 
   const [connectionState, setConnectionState] = useState("closed");
@@ -537,7 +539,6 @@ export function App() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      if (runningRef.current) void captureFrame("periodic");
       if (runningRef.current && client.state === "closed") {
         setSessionReady(false);
         client.connect();
@@ -645,6 +646,30 @@ export function App() {
     [],
   );
 
+  const handleVad = useCallback(
+    (snapshot: VadSnapshot) => {
+      if (!runningRef.current) return;
+      if (snapshot.speechStart) {
+        speechFrameCountRef.current = 1;
+        lastSpeechFrameAtRef.current = Date.now();
+        void captureFrame("speech-start", true);
+      }
+      if (snapshot.isSpeech && speechFrameCountRef.current > 0 && speechFrameCountRef.current < 2) {
+        const now = Date.now();
+        if (now - lastSpeechFrameAtRef.current > 1200) {
+          speechFrameCountRef.current += 1;
+          lastSpeechFrameAtRef.current = now;
+          void captureFrame("speech-active", true);
+        }
+      }
+      if (snapshot.speechEnd) {
+        speechFrameCountRef.current = 0;
+        lastSpeechFrameAtRef.current = 0;
+      }
+    },
+    [captureFrame],
+  );
+
   const startSession = useCallback(async () => {
     let grantedStream: MediaStream | null = null;
     try {
@@ -677,14 +702,13 @@ export function App() {
       await client.waitOpen();
       client.send("session.start");
 
-      const audioCapture = new AudioCapture(client, setLevel);
+      const audioCapture = new AudioCapture(client, setLevel, handleVad);
       await audioCapture.start(grantedStream);
       audioCaptureRef.current = audioCapture;
       runningRef.current = true;
       setAiState("listening");
       setMediaState("running");
       startSpeechRecognition();
-      await captureFrame("startup", true);
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       let message = raw;
@@ -702,7 +726,7 @@ export function App() {
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, startSpeechRecognition]);
+  }, [clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, startSpeechRecognition]);
 
   const stopSession = useCallback(async () => {
     runningRef.current = false;
