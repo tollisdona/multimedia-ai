@@ -8,12 +8,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+DEFAULT_DATABASE_PATH = str(Path(__file__).resolve().parents[1] / "data" / "app.db")
+
+
 @dataclass(frozen=True)
 class Settings:
-    database_path: str = getenv(
-        "DATABASE_PATH",
-        str(Path(__file__).resolve().parents[1] / "data" / "app.db"),
-    )
+    database_path: str = getenv("DATABASE_PATH") or DEFAULT_DATABASE_PATH
     jwt_secret_key: str = getenv("JWT_SECRET_KEY", "dev-only-change-me")
     jwt_algorithm: str = getenv("JWT_ALGORITHM", "HS256")
     access_token_minutes: int = int(getenv("ACCESS_TOKEN_MINUTES", "10080"))

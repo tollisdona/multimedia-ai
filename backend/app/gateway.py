@@ -9,13 +9,14 @@ from starlette.websockets import WebSocketDisconnect
 
 from .ai import analyze_vision
 from .conversation_pipeline import ConversationPipeline, pipecat_runtime_status
+from .db import append_message, save_cost_snapshot, save_vision_summary
 from .models import SessionState, event
 
 
 class GatewayConnection:
-    def __init__(self, websocket: WebSocket, user_id: str) -> None:
+    def __init__(self, websocket: WebSocket, user_id: str, conversation_id: str) -> None:
         self.websocket = websocket
-        self.session = SessionState(user_id=user_id)
+        self.session = SessionState(user_id=user_id, conversation_id=conversation_id)
         self.pipeline = ConversationPipeline(self.session)
         self.generation_task: asyncio.Task[None] | None = None
         self.send_lock = asyncio.Lock()
@@ -25,7 +26,9 @@ class GatewayConnection:
             await self.websocket.send_json(event(event_type, sessionId=self.session.session_id, **payload))
 
     async def send_cost(self) -> None:
-        await self.send("session.cost", cost=self.session.cost.snapshot())
+        snapshot = self.session.cost.snapshot()
+        save_cost_snapshot(self.session.user_id, self.session.conversation_id, snapshot)
+        await self.send("session.cost", cost=snapshot)
 
     async def accept(self) -> None:
         await self.websocket.accept()
@@ -94,7 +97,11 @@ class GatewayConnection:
             return
 
         previous_hash = self.session.latest_vision.frame_hash
-        summary = await analyze_vision(data_url, reason, previous_hash)
+        try:
+            summary = await analyze_vision(data_url, reason, previous_hash)
+        except Exception as exc:
+            await self.send("error", code="vision_failed", message=str(exc))
+            return
         if summary.source == "cache":
             self.session.cost.vision_cache_hits += 1
             summary.summary = self.session.latest_vision.summary
@@ -104,6 +111,18 @@ class GatewayConnection:
         else:
             self.session.cost.vision_frames += 1
         self.session.latest_vision = summary
+        save_vision_summary(
+            self.session.user_id,
+            self.session.conversation_id,
+            {
+                "summary": summary.summary,
+                "objects": summary.objects,
+                "textSeen": summary.text_seen,
+                "confidence": summary.confidence,
+                "source": summary.source,
+                "reason": reason,
+            },
+        )
         await self.send(
             "vision.summary",
             summary=summary.summary,
@@ -119,6 +138,7 @@ class GatewayConnection:
         await self.cancel_generation(silent=True)
         self.session.latest_transcript = text
         self.session.history.append({"role": "user", "content": text})
+        append_message(self.session.user_id, self.session.conversation_id, "user", text)
         await self.send("asr.final", text=text)
         self.generation_task = asyncio.create_task(self.generate_response(text))
 
@@ -132,9 +152,15 @@ class GatewayConnection:
         self.generation_task = None
 
     async def generate_response(self, user_text: str) -> None:
+        answer_parts: list[str] = []
         try:
             async for pipeline_event in self.pipeline.run_user_turn(user_text):
+                if pipeline_event.type == "llm.delta":
+                    answer_parts.append(str(pipeline_event.payload.get("delta", "")))
                 await self.send(pipeline_event.type, **pipeline_event.payload)
+            answer = "".join(answer_parts).strip()
+            if answer:
+                append_message(self.session.user_id, self.session.conversation_id, "assistant", answer)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

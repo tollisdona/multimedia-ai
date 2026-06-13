@@ -2,7 +2,8 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 from .auth import authenticate_token, me_router, router as auth_router
-from .db import init_db
+from .conversations import router as conversations_router
+from .db import create_conversation, get_conversation, init_db
 from .gateway import GatewayConnection
 
 
@@ -19,6 +20,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(me_router)
+app.include_router(conversations_router)
 
 
 @app.on_event("startup")
@@ -37,5 +39,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     if not user:
         await websocket.close(code=4401)
         return
-    connection = GatewayConnection(websocket, user_id=str(user["id"]))
+    user_id = str(user["id"])
+    conversation_id = str(websocket.query_params.get("conversationId") or "")
+    conversation = get_conversation(user_id, conversation_id) if conversation_id else None
+    if not conversation:
+        conversation = create_conversation(user_id, "新会话")
+    connection = GatewayConnection(websocket, user_id=user_id, conversation_id=str(conversation["id"]))
     await connection.run()

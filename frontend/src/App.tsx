@@ -22,12 +22,17 @@ import {
 } from "lucide-react";
 import { AudioCapture } from "./lib/audioCapture";
 import {
+  createConversation,
+  fetchConversationMessages,
+  fetchConversations,
   fetchCurrentUser,
   loadStoredAuth,
   loginUser,
   registerUser,
   storeAuth,
   type AuthSession,
+  type PersistedConversation,
+  type PersistedMessage,
 } from "./lib/api";
 import { GatewayClient } from "./lib/wsClient";
 import type { ChatMessage, CostSnapshot, GatewayEvent, VisionSummary } from "./types";
@@ -78,31 +83,59 @@ function cx(...classes: Array<string | false | null | undefined>) {
   return classes.filter(Boolean).join(" ");
 }
 
-function timeLabel() {
-  return new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+function timeLabel(timestamp = Date.now()) {
+  return new Date(timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 }
 
 function createStarterMessages(): ChatMessage[] {
   return [{ id: uid(), role: "system", text: "混合流式助手已就绪：音频全流式、文本流式、视觉关键帧准实时。" }];
 }
 
-function gatewayUrlWithToken(url: string, token?: string) {
+function gatewayUrlWithToken(url: string, token?: string, conversationId?: string) {
   if (!token) return url;
   const next = new URL(url);
   next.searchParams.set("token", token);
+  if (conversationId) next.searchParams.set("conversationId", conversationId);
   return next.toString();
+}
+
+function conversationToSession(conversation: PersistedConversation): SessionMeta {
+  return {
+    id: conversation.id,
+    title: conversation.title,
+    createdAt: timeLabel(conversation.createdAt),
+    updatedAt: timeLabel(conversation.updatedAt),
+  };
+}
+
+function persistedMessagesToChat(messages: PersistedMessage[]): ChatMessage[] {
+  if (messages.length === 0) return createStarterMessages();
+  return messages.map((message) => ({
+    id: message.id,
+    role: message.role,
+    text: message.text,
+  }));
+}
+
+function isCostSnapshot(value: unknown): value is CostSnapshot {
+  return Boolean(value && typeof value === "object" && "audioSeconds" in value && "estimatedUnits" in value);
+}
+
+function isVisionSummary(value: unknown): value is VisionSummary {
+  return Boolean(value && typeof value === "object" && "summary" in value);
 }
 
 export function App() {
   const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
   const [authSession, setAuthSession] = useState<AuthSession | null>(() => loadStoredAuth());
   const gatewayUrl = import.meta.env.VITE_GATEWAY_URL ?? "ws://localhost:8000/ws";
+  const initialSessionId = useMemo(() => uid(), []);
+  const [currentSessionId, setCurrentSessionId] = useState<string>(initialSessionId);
   const authedGatewayUrl = useMemo(
-    () => gatewayUrlWithToken(gatewayUrl, authSession?.accessToken),
-    [authSession?.accessToken, gatewayUrl],
+    () => gatewayUrlWithToken(gatewayUrl, authSession?.accessToken, currentSessionId),
+    [authSession?.accessToken, currentSessionId, gatewayUrl],
   );
   const client = useMemo(() => new GatewayClient(authedGatewayUrl), [authedGatewayUrl]);
-  const initialSessionId = useMemo(() => uid(), []);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sampleRef = useRef<HTMLCanvasElement | null>(null);
@@ -129,7 +162,6 @@ export function App() {
   const [mediaState, setMediaState] = useState("idle");
   const [level, setLevel] = useState(0);
   const [partial, setPartial] = useState("");
-  const [currentSessionId, setCurrentSessionId] = useState<string>(initialSessionId);
   const [sessions, setSessions] = useState<SessionMeta[]>([
     { id: initialSessionId, title: "当前会话", createdAt: timeLabel(), updatedAt: timeLabel() },
   ]);
@@ -147,6 +179,7 @@ export function App() {
   const [aiState, setAiState] = useState<AiState>("idle");
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [videoPanePercent, setVideoPanePercent] = useState(57.14);
+  const [conversationsLoaded, setConversationsLoaded] = useState(false);
 
   const messages = sessionMessages[currentSessionId] ?? [];
   const setMessages = useCallback(
@@ -204,6 +237,47 @@ export function App() {
       active = false;
     };
   }, [apiBaseUrl, authSession?.accessToken]);
+
+  const loadConversation = useCallback(
+    async (conversationId: string, token = authSession?.accessToken) => {
+      if (!token) return;
+      const persistedMessages = await fetchConversationMessages(apiBaseUrl, token, conversationId);
+      setSessionMessages((store) => ({
+        ...store,
+        [conversationId]: persistedMessagesToChat(persistedMessages),
+      }));
+    },
+    [apiBaseUrl, authSession?.accessToken],
+  );
+
+  useEffect(() => {
+    if (!authSession?.accessToken) return;
+    let active = true;
+    setConversationsLoaded(false);
+    void (async () => {
+      try {
+        let persisted = await fetchConversations(apiBaseUrl, authSession.accessToken);
+        if (persisted.length === 0) {
+          persisted = [await createConversation(apiBaseUrl, authSession.accessToken, "新会话")];
+        }
+        if (!active) return;
+        setSessions(persisted.map(conversationToSession));
+        const first = persisted[0];
+        setCurrentSessionId(first.id);
+        setVision(isVisionSummary(first.latestVision) ? first.latestVision : initialVision);
+        setCost(isCostSnapshot(first.latestCost) ? first.latestCost : emptyCost);
+        await loadConversation(first.id, authSession.accessToken);
+        if (active) setConversationsLoaded(true);
+      } catch (error) {
+        if (!active) return;
+        setLastError(error instanceof Error ? error.message : "加载会话失败");
+        setConversationsLoaded(true);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [apiBaseUrl, authSession?.accessToken, loadConversation]);
 
   const appendMessage = useCallback((message: ChatMessage) => {
     setMessages((current) => [...current.slice(-40), message]);
@@ -384,6 +458,13 @@ export function App() {
       if (event.type === "asr.final") {
         setPartial("");
         appendMessage({ id: uid(), role: "user", text: event.text });
+        setSessions((current) =>
+          current.map((session) =>
+            session.id === currentSessionId && (session.title === "新会话" || session.title === "当前会话" || session.title.startsWith("会话 "))
+              ? { ...session, title: event.text.slice(0, 28), updatedAt: timeLabel() }
+              : session,
+          ),
+        );
         beginAssistantResponse();
       }
       if (event.type === "vision.summary") {
@@ -416,7 +497,7 @@ export function App() {
       if (event.type === "session.cost") setCost(event.cost);
       if (event.type === "error") setLastError(`${event.code}: ${event.message}`);
     },
-    [appendMessage, beginAssistantResponse, enqueueSpeech, finishAssistant, stopSpeech, updateAssistantDelta],
+    [appendMessage, beginAssistantResponse, currentSessionId, enqueueSpeech, finishAssistant, stopSpeech, updateAssistantDelta],
   );
 
   useEffect(() => client.on(handleGatewayEvent), [client, handleGatewayEvent]);
@@ -528,6 +609,10 @@ export function App() {
   const startSession = useCallback(async () => {
     let grantedStream: MediaStream | null = null;
     try {
+      if (!conversationsLoaded || !currentSessionId) {
+        setLastError("会话历史正在加载，请稍后再启动。");
+        return;
+      }
       setLastError("");
       setPermissionStatus("正在请求摄像头和麦克风权限...");
       setAsrStatus("准备启动");
@@ -577,7 +662,7 @@ export function App() {
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [captureFrame, client, startSpeechRecognition]);
+  }, [captureFrame, client, conversationsLoaded, currentSessionId, startSpeechRecognition]);
 
   const stopSession = useCallback(async () => {
     runningRef.current = false;
@@ -626,29 +711,33 @@ export function App() {
     if (canSend) void sendManual();
   }, [cancel, canSend, isProcessing, sendManual]);
 
-  const startNewConversation = useCallback(() => {
+  const startNewConversation = useCallback(async () => {
+    if (!authSession?.accessToken) return;
+    if (runningRef.current) await stopSession();
     if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
-    const id = uid();
-    const now = timeLabel();
-    setSessionMessages((store) => ({ ...store, [id]: createStarterMessages() }));
-    setSessions((current) => [{ id, title: `会话 ${now}`, createdAt: now, updatedAt: now }, ...current]);
-    setCurrentSessionId(id);
+    const conversation = await createConversation(apiBaseUrl, authSession.accessToken, "新会话");
+    setSessionMessages((store) => ({ ...store, [conversation.id]: createStarterMessages() }));
+    setSessions((current) => [conversationToSession(conversation), ...current]);
+    setCurrentSessionId(conversation.id);
     setPartial("");
     setManualText("");
     setVision(initialVision);
+    setCost(emptyCost);
     setActiveView("chat");
-  }, [cancel]);
+  }, [apiBaseUrl, authSession?.accessToken, cancel, stopSession]);
 
   const selectConversation = useCallback(
-    (id: string) => {
+    async (id: string) => {
       if (id === currentSessionId) return;
+      if (runningRef.current) await stopSession();
       if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+      if (!sessionMessages[id]) await loadConversation(id);
       setCurrentSessionId(id);
       setPartial("");
       setManualText("");
       setActiveView("chat");
     },
-    [cancel, currentSessionId],
+    [cancel, currentSessionId, loadConversation, sessionMessages, stopSession],
   );
 
   const handleAuthenticated = useCallback((session: AuthSession) => {
@@ -871,8 +960,8 @@ function HistoryRail({
 }: {
   collapsed: boolean;
   currentSessionId: string;
-  onNewSession: () => void;
-  onSelectSession: (id: string) => void;
+  onNewSession: () => Promise<void>;
+  onSelectSession: (id: string) => Promise<void>;
   onToggle: () => void;
   sessions: SessionListItem[];
 }) {
@@ -888,7 +977,7 @@ function HistoryRail({
         </button>
         <button
           className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50"
-          onClick={onNewSession}
+          onClick={() => void onNewSession()}
           title="新会话"
         >
           <Plus size={18} />
@@ -900,7 +989,7 @@ function HistoryRail({
   return (
     <aside className="border-r border-slate-200 bg-slate-100/80 p-4 max-lg:hidden">
       <div className="mb-5 flex gap-2">
-        <button className="flex h-11 flex-1 items-center gap-2 rounded-2xl bg-white px-4 text-sm font-bold text-slate-800 shadow-sm" onClick={onNewSession}>
+        <button className="flex h-11 flex-1 items-center gap-2 rounded-2xl bg-white px-4 text-sm font-bold text-slate-800 shadow-sm" onClick={() => void onNewSession()}>
           <Plus size={17} /> 新会话
         </button>
         <button className="grid h-11 w-11 place-items-center rounded-2xl bg-white text-slate-600 shadow-sm hover:bg-slate-50" onClick={onToggle} title="收起历史记录">
@@ -921,7 +1010,7 @@ function HistoryRail({
                 "w-full rounded-2xl px-3 py-3 text-left transition",
                 session.id === currentSessionId ? "bg-white text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white",
               )}
-              onClick={() => onSelectSession(session.id)}
+              onClick={() => void onSelectSession(session.id)}
             >
               <span className="flex items-center gap-2 text-sm font-black">
                 <MessageSquare size={15} /> {session.title}

@@ -73,6 +73,10 @@ export JWT_SECRET_KEY="replace-with-a-long-random-secret"
 export DATABASE_PATH="backend/data/app.db"
 ```
 
+The SQLite store keeps users, conversation metadata, text messages, cost
+snapshots, and the latest visual summary. It does not store raw audio,
+continuous video, or camera keyframe images.
+
 ## Streaming Events
 
 Client to Gateway:

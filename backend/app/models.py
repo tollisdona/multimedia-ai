@@ -62,6 +62,7 @@ class VisionSummary:
 class SessionState:
     session_id: str = field(default_factory=lambda: str(uuid4()))
     user_id: str = ""
+    conversation_id: str = ""
     created_at: int = field(default_factory=now_ms)
     latest_transcript: str = ""
     latest_vision: VisionSummary = field(default_factory=VisionSummary)

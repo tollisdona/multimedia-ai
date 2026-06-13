@@ -10,6 +10,23 @@ export interface AuthSession {
   user: AuthUser;
 }
 
+export interface PersistedConversation {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  messageCount: number;
+  latestVision: Record<string, unknown>;
+  latestCost: Record<string, unknown>;
+}
+
+export interface PersistedMessage {
+  id: string;
+  role: "user" | "assistant" | "system";
+  text: string;
+  createdAt: number;
+}
+
 const AUTH_STORAGE_KEY = "ai-vision-auth";
 
 async function requestJson<T>(baseUrl: string, path: string, options: RequestInit = {}, token?: string) {
@@ -62,4 +79,24 @@ export async function loginUser(baseUrl: string, username: string, password: str
 
 export async function fetchCurrentUser(baseUrl: string, token: string) {
   return requestJson<AuthUser>(baseUrl, "/api/me", {}, token);
+}
+
+export async function fetchConversations(baseUrl: string, token: string) {
+  return requestJson<PersistedConversation[]>(baseUrl, "/api/conversations", {}, token);
+}
+
+export async function createConversation(baseUrl: string, token: string, title = "新会话") {
+  return requestJson<PersistedConversation>(
+    baseUrl,
+    "/api/conversations",
+    {
+      method: "POST",
+      body: JSON.stringify({ title }),
+    },
+    token,
+  );
+}
+
+export async function fetchConversationMessages(baseUrl: string, token: string, conversationId: string) {
+  return requestJson<PersistedMessage[]>(baseUrl, `/api/conversations/${conversationId}/messages`, {}, token);
 }
