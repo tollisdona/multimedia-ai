@@ -65,6 +65,14 @@ export VISION_MODEL="qwen-vl-plus"
 
 If these are not set, the backend uses local mock streaming so the protocol and UI remain fully testable.
 
+Local account login uses JWT and SQLite by default. For demos, the app can run
+with the development defaults; for a shared environment, set:
+
+```bash
+export JWT_SECRET_KEY="replace-with-a-long-random-secret"
+export DATABASE_PATH="backend/data/app.db"
+```
+
 ## Streaming Events
 
 Client to Gateway:

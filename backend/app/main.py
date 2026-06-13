@@ -1,6 +1,8 @@
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
+from .auth import authenticate_token, me_router, router as auth_router
+from .db import init_db
 from .gateway import GatewayConnection
 
 
@@ -15,6 +17,15 @@ app.add_middleware(
 )
 
 
+app.include_router(auth_router)
+app.include_router(me_router)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    init_db()
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -22,5 +33,9 @@ async def health() -> dict[str, str]:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    connection = GatewayConnection(websocket)
+    user = authenticate_token(websocket.query_params.get("token"))
+    if not user:
+        await websocket.close(code=4401)
+        return
+    connection = GatewayConnection(websocket, user_id=str(user["id"]))
     await connection.run()

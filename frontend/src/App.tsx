@@ -21,6 +21,14 @@ import {
   WifiOff,
 } from "lucide-react";
 import { AudioCapture } from "./lib/audioCapture";
+import {
+  fetchCurrentUser,
+  loadStoredAuth,
+  loginUser,
+  registerUser,
+  storeAuth,
+  type AuthSession,
+} from "./lib/api";
 import { GatewayClient } from "./lib/wsClient";
 import type { ChatMessage, CostSnapshot, GatewayEvent, VisionSummary } from "./types";
 
@@ -78,9 +86,22 @@ function createStarterMessages(): ChatMessage[] {
   return [{ id: uid(), role: "system", text: "混合流式助手已就绪：音频全流式、文本流式、视觉关键帧准实时。" }];
 }
 
+function gatewayUrlWithToken(url: string, token?: string) {
+  if (!token) return url;
+  const next = new URL(url);
+  next.searchParams.set("token", token);
+  return next.toString();
+}
+
 export function App() {
+  const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+  const [authSession, setAuthSession] = useState<AuthSession | null>(() => loadStoredAuth());
   const gatewayUrl = import.meta.env.VITE_GATEWAY_URL ?? "ws://localhost:8000/ws";
-  const client = useMemo(() => new GatewayClient(gatewayUrl), [gatewayUrl]);
+  const authedGatewayUrl = useMemo(
+    () => gatewayUrlWithToken(gatewayUrl, authSession?.accessToken),
+    [authSession?.accessToken, gatewayUrl],
+  );
+  const client = useMemo(() => new GatewayClient(authedGatewayUrl), [authedGatewayUrl]);
   const initialSessionId = useMemo(() => uid(), []);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -119,6 +140,7 @@ export function App() {
   const [cost, setCost] = useState<CostSnapshot>(emptyCost);
   const [manualText, setManualText] = useState("");
   const [lastError, setLastError] = useState("");
+  const [authError, setAuthError] = useState("");
   const [permissionStatus, setPermissionStatus] = useState("等待启动");
   const [asrStatus, setAsrStatus] = useState("未启动");
   const [activeView, setActiveView] = useState<AppView>("chat");
@@ -163,9 +185,29 @@ export function App() {
     );
   }, [currentSessionId, messages.length]);
 
+  useEffect(() => {
+    if (!authSession?.accessToken) return;
+    let active = true;
+    void fetchCurrentUser(apiBaseUrl, authSession.accessToken)
+      .then((user) => {
+        if (!active) return;
+        const next = { ...authSession, user };
+        setAuthSession(next);
+        storeAuth(next);
+      })
+      .catch(() => {
+        if (!active) return;
+        setAuthSession(null);
+        storeAuth(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [apiBaseUrl, authSession?.accessToken]);
+
   const appendMessage = useCallback((message: ChatMessage) => {
     setMessages((current) => [...current.slice(-40), message]);
-  }, []);
+  }, [setMessages]);
 
   const updateAssistantDelta = useCallback((delta: string, source: "llm" | "tts" = "llm") => {
     assistantTextRef.current = assistantPlaceholderRef.current ? delta : assistantTextRef.current + delta;
@@ -185,7 +227,7 @@ export function App() {
       );
     });
     assistantPlaceholderRef.current = false;
-  }, []);
+  }, [setMessages]);
 
   const beginAssistantResponse = useCallback(() => {
     const id = uid();
@@ -195,7 +237,7 @@ export function App() {
     assistantTextFromTtsRef.current = false;
     setAiState("processing");
     setMessages((current) => [...current, { id, role: "assistant", text: "", streaming: true }]);
-  }, []);
+  }, [setMessages]);
 
   const finishAssistant = useCallback((cancelled: boolean) => {
     const id = assistantMessageIdRef.current;
@@ -217,7 +259,7 @@ export function App() {
     if (!ttsPlayingRef.current && ttsQueueRef.current.length === 0) {
       setAiState(runningRef.current ? "listening" : "idle");
     }
-  }, []);
+  }, [setMessages]);
 
   const processTtsQueue = useCallback(() => {
     if (ttsPlayingRef.current) return;
@@ -609,6 +651,23 @@ export function App() {
     [cancel, currentSessionId],
   );
 
+  const handleAuthenticated = useCallback((session: AuthSession) => {
+    setAuthSession(session);
+    storeAuth(session);
+    setAuthError("");
+  }, []);
+
+  const logout = useCallback(async () => {
+    await stopSession();
+    setAuthSession(null);
+    storeAuth(null);
+    setAuthError("");
+  }, [stopSession]);
+
+  if (!authSession) {
+    return <AuthView apiBaseUrl={apiBaseUrl} error={authError} onAuthenticated={handleAuthenticated} />;
+  }
+
   return (
     <main className="h-screen overflow-hidden bg-slate-50 text-slate-950">
       <div
@@ -673,11 +732,103 @@ export function App() {
               <CostStation cost={cost} connectionState={connectionState} permissionStatus={permissionStatus} asrStatus={asrStatus} />
             )}
             {activeView === "settings" && (
-              <SettingsView gatewayUrl={gatewayUrl} permissionStatus={permissionStatus} asrStatus={asrStatus} />
+              <SettingsView
+                gatewayUrl={gatewayUrl}
+                permissionStatus={permissionStatus}
+                asrStatus={asrStatus}
+                user={authSession.user}
+                onLogout={logout}
+              />
             )}
           </div>
         </section>
       </div>
+    </main>
+  );
+}
+
+function AuthView({
+  apiBaseUrl,
+  error,
+  onAuthenticated,
+}: {
+  apiBaseUrl: string;
+  error: string;
+  onAuthenticated: (session: AuthSession) => void;
+}) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [localError, setLocalError] = useState(error);
+  const [loading, setLoading] = useState(false);
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setLoading(true);
+    setLocalError("");
+    try {
+      const action = mode === "login" ? loginUser : registerUser;
+      const session = await action(apiBaseUrl, username, password);
+      onAuthenticated(session);
+    } catch (authError) {
+      setLocalError(authError instanceof Error ? authError.message : "认证失败");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <main className="grid min-h-screen place-items-center bg-slate-950 px-4 text-slate-950">
+      <form className="w-full max-w-md rounded-[2rem] bg-white p-7 shadow-soft" onSubmit={submit}>
+        <div className="mb-7">
+          <div className="mb-4 grid h-14 w-14 place-items-center rounded-2xl bg-cyan-400 text-lg font-black">AI</div>
+          <h1 className="text-2xl font-black">AI 视觉对话助手</h1>
+          <p className="mt-2 text-sm font-semibold text-slate-500">登录后开始实时视觉对话，会话将按账号隔离。</p>
+        </div>
+        <div className="mb-5 grid grid-cols-2 rounded-2xl bg-slate-100 p-1 text-sm font-black">
+          <button
+            className={cx("rounded-xl py-2", mode === "login" ? "bg-white shadow-sm" : "text-slate-500")}
+            type="button"
+            onClick={() => setMode("login")}
+          >
+            登录
+          </button>
+          <button
+            className={cx("rounded-xl py-2", mode === "register" ? "bg-white shadow-sm" : "text-slate-500")}
+            type="button"
+            onClick={() => setMode("register")}
+          >
+            注册
+          </button>
+        </div>
+        <label className="mb-4 grid gap-2 text-sm font-bold text-slate-600">
+          用户名
+          <input
+            className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400"
+            minLength={3}
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+            autoComplete="username"
+            required
+          />
+        </label>
+        <label className="mb-5 grid gap-2 text-sm font-bold text-slate-600">
+          密码
+          <input
+            className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400"
+            minLength={6}
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            autoComplete={mode === "login" ? "current-password" : "new-password"}
+            required
+          />
+        </label>
+        {localError && <div className="mb-4 rounded-2xl bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{localError}</div>}
+        <button className="h-12 w-full rounded-2xl bg-emerald-700 font-black text-white hover:bg-emerald-800 disabled:opacity-60" disabled={loading}>
+          {loading ? "处理中..." : mode === "login" ? "登录" : "创建账号"}
+        </button>
+      </form>
     </main>
   );
 }
@@ -1125,11 +1276,32 @@ function CostStation({ cost, connectionState, permissionStatus, asrStatus }: { c
   );
 }
 
-function SettingsView({ gatewayUrl, permissionStatus, asrStatus }: { gatewayUrl: string; permissionStatus: string; asrStatus: string }) {
+function SettingsView({
+  gatewayUrl,
+  permissionStatus,
+  asrStatus,
+  user,
+  onLogout,
+}: {
+  gatewayUrl: string;
+  permissionStatus: string;
+  asrStatus: string;
+  user: AuthSession["user"];
+  onLogout: () => Promise<void>;
+}) {
   return (
     <section className="max-w-3xl rounded-[2rem] border border-slate-200 bg-white p-7 shadow-soft">
-      <h2 className="text-2xl font-black">用户设置</h2>
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <h2 className="text-2xl font-black">用户设置</h2>
+          <p className="mt-1 text-sm font-semibold text-slate-500">当前账号：{user.username}</p>
+        </div>
+        <button className="rounded-2xl bg-slate-950 px-4 py-2 text-sm font-bold text-white" onClick={() => void onLogout()}>
+          退出登录
+        </button>
+      </div>
       <div className="mt-6 grid gap-4">
+        <ReadonlyField label="用户 ID" value={user.id} />
         <ReadonlyField label="Gateway 地址" value={gatewayUrl} />
         <ReadonlyField label="权限状态" value={permissionStatus} />
         <ReadonlyField label="语音识别" value={asrStatus} />

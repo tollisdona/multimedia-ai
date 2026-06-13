@@ -13,9 +13,9 @@ from .models import SessionState, event
 
 
 class GatewayConnection:
-    def __init__(self, websocket: WebSocket) -> None:
+    def __init__(self, websocket: WebSocket, user_id: str) -> None:
         self.websocket = websocket
-        self.session = SessionState()
+        self.session = SessionState(user_id=user_id)
         self.pipeline = ConversationPipeline(self.session)
         self.generation_task: asyncio.Task[None] | None = None
         self.send_lock = asyncio.Lock()

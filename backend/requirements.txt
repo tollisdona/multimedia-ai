@@ -3,3 +3,7 @@ uvicorn[standard]==0.34.0
 httpx==0.28.1
 python-dotenv==1.0.1
 pipecat-ai[websocket]==0.0.36
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+bcrypt==4.0.1
+cryptography==42.0.8
