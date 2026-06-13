@@ -103,6 +103,8 @@ export function App() {
   const runningRef = useRef(false);
 
   const [connectionState, setConnectionState] = useState("closed");
+  const [sessionReady, setSessionReady] = useState(false);
+  const [mediaReady, setMediaReady] = useState(false);
   const [mediaState, setMediaState] = useState("idle");
   const [level, setLevel] = useState(0);
   const [partial, setPartial] = useState("");
@@ -138,6 +140,7 @@ export function App() {
 
   const isProcessing = Boolean(assistantMessageIdRef.current);
   const canSend = manualText.trim().length > 0;
+  const gatewayReady = connectionState === "open" && sessionReady && mediaReady;
   const permissionNeedsAction =
     permissionStatus.includes("denied") ||
     permissionStatus.includes("拒绝") ||
@@ -328,7 +331,10 @@ export function App() {
 
   const handleGatewayEvent = useCallback(
     (event: GatewayEvent) => {
-      if (event.type === "session.ready") setConnectionState("open");
+      if (event.type === "session.ready") {
+        setConnectionState("open");
+        setSessionReady(true);
+      }
       if (event.type === "asr.partial") {
         setPartial(event.text);
         setAiState("listening");
@@ -372,12 +378,20 @@ export function App() {
   );
 
   useEffect(() => client.on(handleGatewayEvent), [client, handleGatewayEvent]);
-  useEffect(() => client.onStatus(setConnectionState), [client]);
+  useEffect(
+    () =>
+      client.onStatus((state) => {
+        setConnectionState(state);
+        if (state !== "open") setSessionReady(false);
+      }),
+    [client],
+  );
 
   useEffect(() => {
     const timer = window.setInterval(() => {
       if (runningRef.current) void captureFrame("periodic");
       if (runningRef.current && client.state === "closed") {
+        setSessionReady(false);
         client.connect();
         client.send("session.start");
       }
@@ -470,28 +484,34 @@ export function App() {
   }, [startSpeechRecognition]);
 
   const startSession = useCallback(async () => {
+    let grantedStream: MediaStream | null = null;
     try {
       setLastError("");
       setPermissionStatus("正在请求摄像头和麦克风权限...");
       setAsrStatus("准备启动");
+      setSessionReady(false);
+      setMediaReady(false);
+      client.close();
+
+      grantedStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      setPermissionStatus("摄像头和麦克风已授权");
+      setMediaReady(true);
+      streamRef.current = grantedStream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = grantedStream;
+        await videoRef.current.play();
+      }
+
       setConnectionState("connecting");
       client.connect();
       await client.waitOpen();
       client.send("session.start");
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      setPermissionStatus("摄像头和麦克风已授权");
-      appendMessage({ id: uid(), role: "system", text: "摄像头和麦克风已授权，Gateway 会话已启动。" });
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
       const audioCapture = new AudioCapture(client, setLevel);
-      await audioCapture.start(stream);
+      await audioCapture.start(grantedStream);
       audioCaptureRef.current = audioCapture;
       runningRef.current = true;
       setAiState("listening");
@@ -506,13 +526,16 @@ export function App() {
         if (error.name === "NotFoundError") message = "没有检测到可用的摄像头或麦克风设备。";
         if (error.name === "NotReadableError") message = "摄像头或麦克风被其他应用占用，请关闭占用后重试。";
       }
+      grantedStream?.getTracks().forEach((track) => track.stop());
+      client.close();
+      setSessionReady(false);
+      setMediaReady(false);
       setPermissionStatus("启动失败");
       setLastError(message);
-      appendMessage({ id: uid(), role: "system", text: `启动失败：${message}` });
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [appendMessage, captureFrame, client, startSpeechRecognition]);
+  }, [captureFrame, client, startSpeechRecognition]);
 
   const stopSession = useCallback(async () => {
     runningRef.current = false;
@@ -529,6 +552,8 @@ export function App() {
     streamRef.current = null;
     audioCaptureRef.current = null;
     client.close();
+    setSessionReady(false);
+    setMediaReady(false);
     setMediaState("stopped");
     setConnectionState("closed");
     setAsrStatus("已停止");
@@ -585,10 +610,10 @@ export function App() {
   );
 
   return (
-    <main className="min-h-screen bg-slate-50 text-slate-950">
+    <main className="h-screen overflow-hidden bg-slate-50 text-slate-950">
       <div
         className={cx(
-          "grid min-h-screen max-lg:grid-cols-1",
+          "grid h-screen min-h-0 max-lg:grid-cols-1",
           historyCollapsed
             ? "grid-cols-[72px_58px_1fr] max-xl:grid-cols-[68px_54px_1fr]"
             : "grid-cols-[72px_260px_1fr] max-xl:grid-cols-[68px_220px_1fr]",
@@ -604,16 +629,17 @@ export function App() {
           sessions={historySessions}
         />
 
-        <section className="min-w-0 border-l border-slate-200 bg-white">
+        <section className="flex min-h-0 min-w-0 flex-col border-l border-slate-200 bg-white">
           <TopBar
             activeView={activeView}
             connectionState={connectionState}
+            gatewayReady={gatewayReady}
             mediaState={mediaState}
             startSession={startSession}
             stopSession={stopSession}
           />
 
-          <div className="px-6 pb-6 max-lg:px-4">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6 pb-4 max-lg:px-4">
             {permissionNeedsAction && (
               <PermissionBanner permissionStatus={permissionStatus} startSession={startSession} />
             )}
@@ -763,32 +789,35 @@ function HistoryRail({
 function TopBar({
   activeView,
   connectionState,
+  gatewayReady,
   mediaState,
   startSession,
   stopSession,
 }: {
   activeView: AppView;
   connectionState: string;
+  gatewayReady: boolean;
   mediaState: string;
   startSession: () => Promise<void>;
   stopSession: () => Promise<void>;
 }) {
+  const gatewayLabel = gatewayReady ? "Gateway 已就绪" : connectionState === "open" ? "Gateway 待授权" : "Gateway 未连接";
   return (
-    <header className="flex min-h-24 items-center justify-between gap-4 border-b border-slate-200 px-8 py-5 max-md:flex-col max-md:items-start max-md:px-4">
+    <header className="flex min-h-16 items-center justify-between gap-4 border-b border-slate-200 px-7 py-3 max-md:flex-col max-md:items-start max-md:px-4">
       <div>
-        <h1 className="text-2xl font-black tracking-tight">
+        <h1 className="text-xl font-black tracking-tight">
           {activeView === "chat" ? "AI 视觉对话助手" : activeView === "cost" ? "模型消耗中转站" : "用户设置"}
         </h1>
-        <p className="mt-1 text-sm font-semibold text-slate-500">Tailwind UI · WebSocket Gateway · Pipecat-ready Pipeline · 视觉关键帧</p>
+        <p className="mt-0.5 text-xs font-semibold text-slate-500">Tailwind UI · WebSocket Gateway · Pipecat-ready Pipeline · 视觉关键帧</p>
       </div>
       <div className="flex items-center gap-3">
-        <StatusPill label={connectionState === "open" ? "Gateway 已连接" : "Gateway 未连接"} active={connectionState === "open"} />
+        <StatusPill label={gatewayLabel} active={gatewayReady} />
         {mediaState !== "running" ? (
-          <button className="inline-flex h-11 items-center gap-2 rounded-2xl bg-emerald-700 px-5 font-bold text-white hover:bg-emerald-800" onClick={() => void startSession()}>
+          <button className="inline-flex h-10 items-center gap-2 rounded-2xl bg-emerald-700 px-5 text-sm font-bold text-white hover:bg-emerald-800" onClick={() => void startSession()}>
             <Play size={18} /> 启动会话
           </button>
         ) : (
-          <button className="inline-flex h-11 items-center gap-2 rounded-2xl bg-rose-600 px-5 font-bold text-white hover:bg-rose-700" onClick={() => void stopSession()}>
+          <button className="inline-flex h-10 items-center gap-2 rounded-2xl bg-rose-600 px-5 text-sm font-bold text-white hover:bg-rose-700" onClick={() => void stopSession()}>
             <CircleStop size={18} /> 停止
           </button>
         )}
@@ -884,7 +913,7 @@ function ChatView(props: {
   return (
     <section
       ref={gridRef}
-      className="grid gap-5 xl:grid-cols-[minmax(320px,var(--video-fr))_12px_minmax(360px,var(--chat-fr))]"
+      className="grid min-h-0 flex-1 gap-5 xl:grid-cols-[minmax(320px,var(--video-fr))_12px_minmax(360px,var(--chat-fr))]"
       style={
         {
           "--video-fr": `${videoPanePercent}fr`,
@@ -892,7 +921,7 @@ function ChatView(props: {
         } as React.CSSProperties
       }
     >
-      <div className="min-w-0">
+      <div className="min-h-0 min-w-0">
         <div className="relative aspect-[4/3] overflow-hidden rounded-3xl border border-slate-200 bg-slate-900 shadow-soft">
           <video ref={videoRef} playsInline muted className="h-full w-full object-cover" />
           <canvas ref={canvasRef} hidden />
@@ -915,7 +944,7 @@ function ChatView(props: {
         title="拖拽调整视频和对话宽度"
       />
 
-      <div className="flex min-h-[720px] min-w-0 flex-col rounded-3xl border border-slate-200 bg-white shadow-soft">
+      <div className="flex min-h-0 min-w-0 flex-col rounded-3xl border border-slate-200 bg-white shadow-soft">
         <div className="flex min-h-16 items-center justify-between border-b border-slate-200 px-5">
           <div className="flex items-center gap-2 font-black"><Radio size={18} /> 实时对话</div>
           {partial && <div className="max-w-[52%] truncate rounded-full bg-cyan-50 px-3 py-1 text-sm font-bold text-cyan-700">正在听：{partial}</div>}
@@ -923,6 +952,7 @@ function ChatView(props: {
         <div ref={messageScrollerRef} className="flex-1 space-y-5 overflow-auto px-6 py-6">
           {messages.map((message) => {
             if (message.role === "assistant" && !message.text.trim()) return null;
+            if (message.role === "system") return null;
             return <MessageBubble key={message.id} message={message} />;
           })}
         </div>
@@ -942,7 +972,6 @@ function ChatView(props: {
 
 function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
-  const isSystem = message.role === "system";
   return (
     <article className={cx("flex", isUser ? "justify-end" : "justify-start")}>
       <div
@@ -950,7 +979,6 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           "max-w-[78%] rounded-[1.35rem] px-5 py-4 shadow-sm",
           isUser && "bg-slate-950 text-white",
           message.role === "assistant" && "bg-white text-slate-900 ring-1 ring-slate-200",
-          isSystem && "max-w-full bg-slate-100 text-slate-700",
         )}
       >
         <span className={cx("mb-2 block text-xs font-black uppercase tracking-wide", isUser ? "text-white/60" : "text-slate-400")}>
