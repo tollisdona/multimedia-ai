@@ -36,7 +36,7 @@ import {
   type PersistedMessage,
 } from "./lib/api";
 import { GatewayClient } from "./lib/wsClient";
-import type { ChatMessage, CostSnapshot, GatewayEvent } from "./types";
+import type { ChatMessage, CostSnapshot, GatewayEvent, VadSnapshot } from "./types";
 
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
 const SPEECH_AUTO_SEND_DELAY_MS = 1200;
@@ -151,6 +151,7 @@ export function App() {
   const realtimeAudioRef = useRef(false);
   const modelAudioPlayingRef = useRef(false);
   const runningRef = useRef(false);
+  const aiStateRef = useRef<AiState>("idle");
 
   const [connectionState, setConnectionState] = useState("closed");
   const [sessionReady, setSessionReady] = useState(false);
@@ -205,6 +206,10 @@ export function App() {
       })),
     [sessionMessages, sessions],
   );
+
+  useEffect(() => {
+    aiStateRef.current = aiState;
+  }, [aiState]);
 
   useEffect(() => {
     setSessions((current) =>
@@ -409,6 +414,31 @@ export function App() {
     setAiState(runningRef.current ? "listening" : "idle");
     window.speechSynthesis?.cancel();
   }, []);
+
+  const interruptActiveSpeech = useCallback(
+    (reason = "barge_in") => {
+      client.send("speech.cancel", { reason });
+      clearPendingSpeech();
+      stopModelAudio();
+      stopSpeech();
+      if (assistantMessageIdRef.current) finishAssistant(true);
+      setAiState(runningRef.current ? "listening" : "idle");
+    },
+    [clearPendingSpeech, client, finishAssistant, stopModelAudio, stopSpeech],
+  );
+
+  const handleVad = useCallback(
+    (snapshot: VadSnapshot) => {
+      if (!runningRef.current || !snapshot.speechStart) return;
+      const assistantIsSpeaking =
+        modelAudioPlayingRef.current ||
+        aiStateRef.current === "speaking" ||
+        ttsPlayingRef.current ||
+        ttsQueueRef.current.length > 0;
+      if (assistantIsSpeaking) interruptActiveSpeech("barge_in");
+    },
+    [interruptActiveSpeech],
+  );
 
   const computeFrameDiff = useCallback(() => {
     const video = videoRef.current;
@@ -730,7 +760,7 @@ export function App() {
       await client.waitOpen();
       client.send("session.start");
 
-      const audioCapture = new AudioCapture(client, setLevel);
+      const audioCapture = new AudioCapture(client, setLevel, handleVad);
       await audioCapture.start(grantedStream);
       audioCaptureRef.current = audioCapture;
       runningRef.current = true;
@@ -756,7 +786,7 @@ export function App() {
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, startSpeechRecognition]);
+  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, startSpeechRecognition]);
 
   const stopSession = useCallback(async () => {
     runningRef.current = false;
