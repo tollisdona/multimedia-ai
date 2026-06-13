@@ -1,18 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Activity,
+  ArrowUp,
+  BarChart3,
   Camera,
   CircleStop,
   Eye,
+  History,
+  MessageSquare,
   Mic,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plus,
   Play,
   Radio,
-  Send,
-  Sparkles,
+  Settings,
+  Shield,
+  Square,
   Volume2,
   Wifi,
   WifiOff,
-  Zap,
 } from "lucide-react";
 import { AudioCapture } from "./lib/audioCapture";
 import { GatewayClient } from "./lib/wsClient";
@@ -42,6 +48,16 @@ const initialVision: VisionSummary = {
   reason: "none",
 };
 
+type AppView = "chat" | "cost" | "settings";
+type AiState = "idle" | "listening" | "processing" | "speaking";
+type SessionMeta = {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+};
+type SessionListItem = SessionMeta & { messageCount: number };
+
 function uid() {
   return crypto.randomUUID();
 }
@@ -50,9 +66,22 @@ function containsVisualIntent(text: string) {
   return visualKeywords.some((keyword) => text.includes(keyword));
 }
 
+function cx(...classes: Array<string | false | null | undefined>) {
+  return classes.filter(Boolean).join(" ");
+}
+
+function timeLabel() {
+  return new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+
+function createStarterMessages(): ChatMessage[] {
+  return [{ id: uid(), role: "system", text: "混合流式助手已就绪：音频全流式、文本流式、视觉关键帧准实时。" }];
+}
+
 export function App() {
   const gatewayUrl = import.meta.env.VITE_GATEWAY_URL ?? "ws://localhost:8000/ws";
   const client = useMemo(() => new GatewayClient(gatewayUrl), [gatewayUrl]);
+  const initialSessionId = useMemo(() => uid(), []);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sampleRef = useRef<HTMLCanvasElement | null>(null);
@@ -60,8 +89,15 @@ export function App() {
   const recognitionRef = useRef<any>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const assistantMessageIdRef = useRef<string | null>(null);
+  const assistantPlaceholderRef = useRef(false);
+  const assistantTextRef = useRef("");
+  const assistantTextFromTtsRef = useRef(false);
   const ttsQueueRef = useRef<string[]>([]);
   const ttsPlayingRef = useRef(false);
+  const recognitionPausedForTtsRef = useRef(false);
+  const recognitionDisabledRef = useRef(false);
+  const recognitionRestartTimerRef = useRef(0);
+  const recognitionStarterRef = useRef<() => void>(() => {});
   const lastSampleRef = useRef<Uint8ClampedArray | null>(null);
   const lastVisionAtRef = useRef(0);
   const runningRef = useRef(false);
@@ -70,55 +106,139 @@ export function App() {
   const [mediaState, setMediaState] = useState("idle");
   const [level, setLevel] = useState(0);
   const [partial, setPartial] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: uid(),
-      role: "system",
-      text: "混合流式助手已就绪：音频全流式、文本流式、视觉关键帧准实时。",
-    },
+  const [currentSessionId, setCurrentSessionId] = useState<string>(initialSessionId);
+  const [sessions, setSessions] = useState<SessionMeta[]>([
+    { id: initialSessionId, title: "当前会话", createdAt: timeLabel(), updatedAt: timeLabel() },
   ]);
+  const [sessionMessages, setSessionMessages] = useState<Record<string, ChatMessage[]>>({
+    [initialSessionId]: createStarterMessages(),
+  });
   const [vision, setVision] = useState<VisionSummary>(initialVision);
   const [cost, setCost] = useState<CostSnapshot>(emptyCost);
   const [manualText, setManualText] = useState("");
   const [lastError, setLastError] = useState("");
+  const [permissionStatus, setPermissionStatus] = useState("等待启动");
+  const [asrStatus, setAsrStatus] = useState("未启动");
+  const [activeView, setActiveView] = useState<AppView>("chat");
+  const [aiState, setAiState] = useState<AiState>("idle");
+  const [historyCollapsed, setHistoryCollapsed] = useState(false);
+  const [videoPanePercent, setVideoPanePercent] = useState(57.14);
+
+  const messages = sessionMessages[currentSessionId] ?? [];
+  const setMessages = useCallback(
+    (updater: ChatMessage[] | ((current: ChatMessage[]) => ChatMessage[])) => {
+      setSessionMessages((store) => {
+        const current = store[currentSessionId] ?? createStarterMessages();
+        const next = typeof updater === "function" ? updater(current) : updater;
+        return { ...store, [currentSessionId]: next };
+      });
+    },
+    [currentSessionId],
+  );
+
+  const isProcessing = Boolean(assistantMessageIdRef.current);
+  const canSend = manualText.trim().length > 0;
+  const permissionNeedsAction =
+    permissionStatus.includes("denied") ||
+    permissionStatus.includes("拒绝") ||
+    permissionStatus.includes("失败") ||
+    permissionStatus.includes("等待启动");
+  const historySessions = useMemo<SessionListItem[]>(
+    () =>
+      sessions.map((session) => ({
+        ...session,
+        messageCount: (sessionMessages[session.id] ?? []).filter((message) => message.role !== "system").length,
+      })),
+    [sessionMessages, sessions],
+  );
+
+  useEffect(() => {
+    setSessions((current) =>
+      current.map((session) =>
+        session.id === currentSessionId ? { ...session, updatedAt: timeLabel() } : session,
+      ),
+    );
+  }, [currentSessionId, messages.length]);
 
   const appendMessage = useCallback((message: ChatMessage) => {
-    setMessages((current) => [...current.slice(-30), message]);
+    setMessages((current) => [...current.slice(-40), message]);
   }, []);
 
-  const updateAssistantDelta = useCallback((delta: string) => {
+  const updateAssistantDelta = useCallback((delta: string, source: "llm" | "tts" = "llm") => {
+    assistantTextRef.current = assistantPlaceholderRef.current ? delta : assistantTextRef.current + delta;
+    assistantTextFromTtsRef.current = source === "tts";
     setMessages((current) => {
       let id = assistantMessageIdRef.current;
       if (!id) {
         id = uid();
         assistantMessageIdRef.current = id;
+        assistantPlaceholderRef.current = false;
         return [...current, { id, role: "assistant", text: delta, streaming: true }];
       }
       return current.map((message) =>
-        message.id === id ? { ...message, text: message.text + delta, streaming: true } : message,
+        message.id === id
+          ? { ...message, text: assistantPlaceholderRef.current ? delta : message.text + delta, streaming: true }
+          : message,
       );
     });
+    assistantPlaceholderRef.current = false;
+  }, []);
+
+  const beginAssistantResponse = useCallback(() => {
+    const id = uid();
+    assistantMessageIdRef.current = id;
+    assistantPlaceholderRef.current = true;
+    assistantTextRef.current = "";
+    assistantTextFromTtsRef.current = false;
+    setAiState("processing");
+    setMessages((current) => [...current, { id, role: "assistant", text: "", streaming: true }]);
   }, []);
 
   const finishAssistant = useCallback((cancelled: boolean) => {
+    const id = assistantMessageIdRef.current;
     setMessages((current) =>
       current.map((message) =>
-        message.id === assistantMessageIdRef.current
-          ? { ...message, text: cancelled ? `${message.text}\n[已中断]` : message.text, streaming: false }
+        message.id === id
+          ? {
+              ...message,
+              text: cancelled && message.text.trim() ? `${message.text}\n[已中断]` : message.text,
+              streaming: false,
+            }
           : message,
       ),
     );
     assistantMessageIdRef.current = null;
+    assistantPlaceholderRef.current = false;
+    assistantTextRef.current = "";
+    assistantTextFromTtsRef.current = false;
+    if (!ttsPlayingRef.current && ttsQueueRef.current.length === 0) {
+      setAiState(runningRef.current ? "listening" : "idle");
+    }
   }, []);
 
   const processTtsQueue = useCallback(() => {
     if (ttsPlayingRef.current) return;
     const next = ttsQueueRef.current.shift();
-    if (!next || !("speechSynthesis" in window)) return;
+    if (!next || !("speechSynthesis" in window)) {
+      recognitionPausedForTtsRef.current = false;
+      if (runningRef.current && !recognitionDisabledRef.current) {
+        window.clearTimeout(recognitionRestartTimerRef.current);
+        recognitionRestartTimerRef.current = window.setTimeout(() => recognitionStarterRef.current(), 250);
+      }
+      setAiState(runningRef.current ? "listening" : "idle");
+      return;
+    }
+    recognitionPausedForTtsRef.current = true;
+    try {
+      recognitionRef.current?.stop?.();
+    } catch {
+      // Browser may throw if recognition is already stopped.
+    }
     ttsPlayingRef.current = true;
+    setAiState("speaking");
     const utterance = new SpeechSynthesisUtterance(next);
     utterance.lang = "zh-CN";
-    utterance.rate = 1.04;
+    utterance.rate = 0.98;
     utterance.pitch = 1;
     utterance.onend = () => {
       ttsPlayingRef.current = false;
@@ -143,6 +263,8 @@ export function App() {
   const stopSpeech = useCallback(() => {
     ttsQueueRef.current = [];
     ttsPlayingRef.current = false;
+    recognitionPausedForTtsRef.current = false;
+    setAiState(runningRef.current ? "listening" : "idle");
     window.speechSynthesis?.cancel();
   }, []);
 
@@ -160,9 +282,7 @@ export function App() {
     lastSampleRef.current = new Uint8ClampedArray(data);
     if (!previous) return 100;
     let diff = 0;
-    for (let i = 0; i < data.length; i += 16) {
-      diff += Math.abs(data[i] - previous[i]);
-    }
+    for (let i = 0; i < data.length; i += 16) diff += Math.abs(data[i] - previous[i]);
     return diff / (data.length / 16);
   }, []);
 
@@ -195,27 +315,31 @@ export function App() {
     async (text: string) => {
       const clean = text.trim();
       if (!clean) return;
-      if (containsVisualIntent(clean)) {
-        await captureFrame("semantic", true);
+      if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) {
+        client.send("speech.cancel", { reason: "new_user_turn" });
+        stopSpeech();
+        finishAssistant(true);
       }
+      if (containsVisualIntent(clean)) await captureFrame("semantic", true);
       client.send("browser.asr.final", { text: clean });
     },
-    [captureFrame, client],
+    [captureFrame, client, finishAssistant, stopSpeech],
   );
 
   const handleGatewayEvent = useCallback(
     (event: GatewayEvent) => {
-      if (event.type === "session.ready") {
-        setConnectionState("open");
-      }
+      if (event.type === "session.ready") setConnectionState("open");
       if (event.type === "asr.partial") {
         setPartial(event.text);
+        setAiState("listening");
       }
       if (event.type === "asr.final") {
         setPartial("");
         appendMessage({ id: uid(), role: "user", text: event.text });
+        beginAssistantResponse();
       }
       if (event.type === "vision.summary") {
+        setAiState((current) => (current === "speaking" ? current : "processing"));
         setVision({
           summary: event.summary,
           objects: event.objects,
@@ -226,48 +350,78 @@ export function App() {
         });
       }
       if (event.type === "llm.delta") {
+        setAiState((current) => (current === "speaking" ? current : "processing"));
         updateAssistantDelta(event.delta);
       }
       if (event.type === "tts.audio.chunk") {
+        if (!assistantMessageIdRef.current) beginAssistantResponse();
+        if (event.text?.trim() && (assistantTextFromTtsRef.current || !assistantTextRef.current.trim())) {
+          updateAssistantDelta(event.text, "tts");
+        }
         enqueueSpeech(event.text);
       }
-      if (event.type === "llm.done") {
-        finishAssistant(event.cancelled);
-      }
+      if (event.type === "llm.done") finishAssistant(event.cancelled);
       if (event.type === "speech.cancelled") {
         stopSpeech();
         finishAssistant(true);
       }
-      if (event.type === "session.cost") {
-        setCost(event.cost);
-      }
-      if (event.type === "error") {
-        setLastError(`${event.code}: ${event.message}`);
-      }
+      if (event.type === "session.cost") setCost(event.cost);
+      if (event.type === "error") setLastError(`${event.code}: ${event.message}`);
     },
-    [appendMessage, enqueueSpeech, finishAssistant, stopSpeech, updateAssistantDelta],
+    [appendMessage, beginAssistantResponse, enqueueSpeech, finishAssistant, stopSpeech, updateAssistantDelta],
   );
 
   useEffect(() => client.on(handleGatewayEvent), [client, handleGatewayEvent]);
+  useEffect(() => client.onStatus(setConnectionState), [client]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
       if (runningRef.current) void captureFrame("periodic");
+      if (runningRef.current && client.state === "closed") {
+        client.connect();
+        client.send("session.start");
+      }
       setConnectionState(client.state);
     }, 5000);
     return () => window.clearInterval(timer);
   }, [captureFrame, client]);
 
+  const checkMediaPermissions = useCallback(async () => {
+    if (!navigator.permissions?.query) {
+      setPermissionStatus("浏览器不支持权限预检，将在启动时请求授权");
+      return;
+    }
+    try {
+      const [camera, microphone] = await Promise.all([
+        navigator.permissions.query({ name: "camera" as PermissionName }),
+        navigator.permissions.query({ name: "microphone" as PermissionName }),
+      ]);
+      const label = `摄像头：${camera.state}；麦克风：${microphone.state}`;
+      setPermissionStatus(label);
+    } catch {
+      setPermissionStatus("权限预检不可用，将在启动时请求授权");
+    }
+  }, []);
+
+  useEffect(() => {
+    void checkMediaPermissions();
+  }, [checkMediaPermissions]);
+
   const startSpeechRecognition = useCallback(() => {
+    if (recognitionRef.current || recognitionDisabledRef.current || recognitionPausedForTtsRef.current) return;
     const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
     if (!Recognition) {
-      setLastError("当前浏览器不支持 Web Speech API，可使用右下角文本输入兜底。");
+      const message = "当前浏览器不支持 Web Speech API，可使用文本输入兜底。";
+      setAsrStatus("文本兜底");
+      setLastError(message);
+      appendMessage({ id: uid(), role: "system", text: message });
       return;
     }
     const recognition = new Recognition();
     recognition.lang = "zh-CN";
     recognition.continuous = true;
     recognition.interimResults = true;
+    setAsrStatus("浏览器 ASR 运行中");
     recognition.onresult = (event: any) => {
       let interim = "";
       let finalText = "";
@@ -280,24 +434,46 @@ export function App() {
       if (finalText.trim()) void sendFinalTranscript(finalText.trim());
     };
     recognition.onerror = (event: any) => {
-      setLastError(`语音识别错误：${event.error ?? "unknown"}`);
+      const error = event.error ?? "unknown";
+      if (error === "network") {
+        recognitionDisabledRef.current = true;
+        setAsrStatus("ASR 网络不可用，已切换文本兜底");
+        const message = "浏览器语音识别报 network。会话仍可继续，请用文本输入；麦克风音频流和成本统计仍在运行。";
+        setLastError(message);
+        appendMessage({ id: uid(), role: "system", text: message });
+        try {
+          recognition.stop();
+        } catch {
+          // Ignore duplicate stop.
+        }
+        return;
+      }
+      if (error !== "no-speech") setLastError(`语音识别错误：${error}`);
     };
     recognition.onend = () => {
-      if (runningRef.current) {
-        try {
-          recognition.start();
-        } catch {
-          // Browser may throttle immediate restarts.
-        }
+      recognitionRef.current = null;
+      if (runningRef.current && !recognitionPausedForTtsRef.current && !recognitionDisabledRef.current) {
+        window.clearTimeout(recognitionRestartTimerRef.current);
+        recognitionRestartTimerRef.current = window.setTimeout(() => startSpeechRecognition(), 650);
       }
     };
     recognitionRef.current = recognition;
-    recognition.start();
-  }, [client, sendFinalTranscript]);
+    try {
+      recognition.start();
+    } catch {
+      recognitionRef.current = null;
+    }
+  }, [appendMessage, client, sendFinalTranscript]);
+
+  useEffect(() => {
+    recognitionStarterRef.current = startSpeechRecognition;
+  }, [startSpeechRecognition]);
 
   const startSession = useCallback(async () => {
     try {
       setLastError("");
+      setPermissionStatus("正在请求摄像头和麦克风权限...");
+      setAsrStatus("准备启动");
       setConnectionState("connecting");
       client.connect();
       await client.waitOpen();
@@ -307,33 +483,47 @@ export function App() {
         video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
+      setPermissionStatus("摄像头和麦克风已授权");
+      appendMessage({ id: uid(), role: "system", text: "摄像头和麦克风已授权，Gateway 会话已启动。" });
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
-      const audioCapture = new AudioCapture(
-        client,
-        setLevel,
-        () => Boolean(assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length),
-      );
+      const audioCapture = new AudioCapture(client, setLevel);
       await audioCapture.start(stream);
       audioCaptureRef.current = audioCapture;
       runningRef.current = true;
+      setAiState("listening");
       setMediaState("running");
       startSpeechRecognition();
       await captureFrame("startup", true);
     } catch (error) {
-      setLastError(error instanceof Error ? error.message : String(error));
+      const raw = error instanceof Error ? error.message : String(error);
+      let message = raw;
+      if (error instanceof DOMException) {
+        if (error.name === "NotAllowedError") message = "摄像头或麦克风权限被拒绝，请在浏览器地址栏权限设置中允许后重试。";
+        if (error.name === "NotFoundError") message = "没有检测到可用的摄像头或麦克风设备。";
+        if (error.name === "NotReadableError") message = "摄像头或麦克风被其他应用占用，请关闭占用后重试。";
+      }
+      setPermissionStatus("启动失败");
+      setLastError(message);
+      appendMessage({ id: uid(), role: "system", text: `启动失败：${message}` });
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [captureFrame, client, startSpeechRecognition]);
+  }, [appendMessage, captureFrame, client, startSpeechRecognition]);
 
   const stopSession = useCallback(async () => {
     runningRef.current = false;
-    stopSpeech();
+    ttsQueueRef.current = [];
+    ttsPlayingRef.current = false;
+    window.speechSynthesis?.cancel();
+    window.clearTimeout(recognitionRestartTimerRef.current);
+    recognitionDisabledRef.current = false;
+    recognitionPausedForTtsRef.current = false;
     recognitionRef.current?.stop?.();
+    recognitionRef.current = null;
     await audioCaptureRef.current?.stop();
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
@@ -341,7 +531,9 @@ export function App() {
     client.close();
     setMediaState("stopped");
     setConnectionState("closed");
-  }, [client, stopSpeech]);
+    setAsrStatus("已停止");
+    setAiState("idle");
+  }, [client]);
 
   const sendManual = useCallback(async () => {
     const text = manualText.trim();
@@ -352,135 +544,594 @@ export function App() {
 
   const cancel = useCallback(() => {
     client.send("speech.cancel", { reason: "manual" });
-    stopSpeech();
-  }, [client, stopSpeech]);
+    ttsQueueRef.current = [];
+    ttsPlayingRef.current = false;
+    window.speechSynthesis?.cancel();
+    finishAssistant(true);
+    setAiState(runningRef.current ? "listening" : "idle");
+  }, [client, finishAssistant]);
+
+  const handleComposerAction = useCallback(() => {
+    if (isProcessing) {
+      cancel();
+      return;
+    }
+    if (canSend) void sendManual();
+  }, [cancel, canSend, isProcessing, sendManual]);
+
+  const startNewConversation = useCallback(() => {
+    if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+    const id = uid();
+    const now = timeLabel();
+    setSessionMessages((store) => ({ ...store, [id]: createStarterMessages() }));
+    setSessions((current) => [{ id, title: `会话 ${now}`, createdAt: now, updatedAt: now }, ...current]);
+    setCurrentSessionId(id);
+    setPartial("");
+    setManualText("");
+    setVision(initialVision);
+    setActiveView("chat");
+  }, [cancel]);
+
+  const selectConversation = useCallback(
+    (id: string) => {
+      if (id === currentSessionId) return;
+      if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+      setCurrentSessionId(id);
+      setPartial("");
+      setManualText("");
+      setActiveView("chat");
+    },
+    [cancel, currentSessionId],
+  );
 
   return (
-    <main className="app-shell">
-      <section className="topbar">
-        <div>
-          <h1>AI 视觉对话助手</h1>
-          <p>自建 WebSocket Gateway · 音频流式 · 视觉关键帧 · 成本可控</p>
-        </div>
-        <div className="topbar-actions">
-          <StatusPill label={connectionState === "open" ? "Gateway 已连接" : "Gateway 未连接"} active={connectionState === "open"} />
-          {mediaState !== "running" ? (
-            <button className="primary" onClick={() => void startSession()}>
-              <Play size={18} /> 启动会话
-            </button>
-          ) : (
-            <button className="danger" onClick={() => void stopSession()}>
-              <CircleStop size={18} /> 停止
-            </button>
-          )}
-        </div>
-      </section>
+    <main className="min-h-screen bg-slate-50 text-slate-950">
+      <div
+        className={cx(
+          "grid min-h-screen max-lg:grid-cols-1",
+          historyCollapsed
+            ? "grid-cols-[72px_58px_1fr] max-xl:grid-cols-[68px_54px_1fr]"
+            : "grid-cols-[72px_260px_1fr] max-xl:grid-cols-[68px_220px_1fr]",
+        )}
+      >
+        <IconSidebar activeView={activeView} setActiveView={setActiveView} />
+        <HistoryRail
+          collapsed={historyCollapsed}
+          currentSessionId={currentSessionId}
+          onNewSession={startNewConversation}
+          onSelectSession={selectConversation}
+          onToggle={() => setHistoryCollapsed((current) => !current)}
+          sessions={historySessions}
+        />
 
-      <section className="workspace">
-        <div className="left-pane">
-          <div className="video-panel">
-            <video ref={videoRef} playsInline muted />
-            <canvas ref={canvasRef} hidden />
-            <canvas ref={sampleRef} hidden />
-            <div className="video-overlay">
-              <span><Camera size={16} /> 关键帧模式</span>
-              <button onClick={() => void captureFrame("manual", true)}>
-                <Eye size={16} /> 抓取画面
-              </button>
-            </div>
-          </div>
+        <section className="min-w-0 border-l border-slate-200 bg-white">
+          <TopBar
+            activeView={activeView}
+            connectionState={connectionState}
+            mediaState={mediaState}
+            startSession={startSession}
+            stopSession={stopSession}
+          />
 
-          <div className="meter-row">
-            <div className="meter-card">
-              <Mic size={18} />
-              <div>
-                <strong>麦克风流</strong>
-                <div className="meter"><span style={{ width: `${Math.min(level * 900, 100)}%` }} /></div>
+          <div className="px-6 pb-6 max-lg:px-4">
+            {permissionNeedsAction && (
+              <PermissionBanner permissionStatus={permissionStatus} startSession={startSession} />
+            )}
+            {lastError && (
+              <div className="mb-4 flex items-center gap-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-800">
+                <WifiOff size={17} /> {lastError}
               </div>
-            </div>
-            <button className="secondary" onClick={cancel}>
-              <Zap size={17} /> 打断
-            </button>
-          </div>
+            )}
 
-          <div className="vision-card">
-            <div className="section-title"><Sparkles size={18} /> 最新视觉摘要</div>
-            <p>{vision.summary}</p>
-            <div className="tag-row">
-              <span>来源：{vision.source}</span>
-              <span>触发：{vision.reason}</span>
-              <span>置信度：{Math.round(vision.confidence * 100)}%</span>
-            </div>
-            {vision.objects.length > 0 && <div className="chips">{vision.objects.map((item) => <b key={item}>{item}</b>)}</div>}
+            {activeView === "chat" && (
+              <ChatView
+                aiState={aiState}
+                canSend={canSend}
+                captureFrame={captureFrame}
+                handleComposerAction={handleComposerAction}
+                isProcessing={isProcessing}
+                level={level}
+                manualText={manualText}
+                messages={messages}
+                partial={partial}
+                setManualText={setManualText}
+                sendManual={sendManual}
+                videoRef={videoRef}
+                canvasRef={canvasRef}
+                sampleRef={sampleRef}
+                videoPanePercent={videoPanePercent}
+                setVideoPanePercent={setVideoPanePercent}
+              />
+            )}
+            {activeView === "cost" && (
+              <CostStation cost={cost} connectionState={connectionState} permissionStatus={permissionStatus} asrStatus={asrStatus} />
+            )}
+            {activeView === "settings" && (
+              <SettingsView gatewayUrl={gatewayUrl} permissionStatus={permissionStatus} asrStatus={asrStatus} />
+            )}
           </div>
-        </div>
-
-        <div className="center-pane">
-          <div className="chat-header">
-            <div className="section-title"><Radio size={18} /> 实时对话</div>
-            {partial && <div className="partial">正在听：{partial}</div>}
-          </div>
-          <div className="messages">
-            {messages.map((message) => (
-              <article className={`message ${message.role}`} key={message.id}>
-                <span>{message.role === "assistant" ? "AI" : message.role === "user" ? "你" : "系统"}</span>
-                <p>{message.text}{message.streaming ? " ▌" : ""}</p>
-              </article>
-            ))}
-          </div>
-          <div className="manual-input">
-            <input
-              value={manualText}
-              onChange={(event) => setManualText(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") void sendManual();
-              }}
-              placeholder="语音识别不可用时，在这里输入一句话..."
-            />
-            <button onClick={() => void sendManual()}>
-              <Send size={17} /> 发送
-            </button>
-          </div>
-        </div>
-
-        <aside className="right-pane">
-          <div className="section-title"><Activity size={18} /> 成本面板</div>
-          <CostItem label="音频总时长" value={`${cost.audioSeconds}s`} />
-          <CostItem label="有效语音" value={`${cost.speechSeconds}s`} />
-          <CostItem label="音频帧" value={cost.audioChunks.toString()} />
-          <CostItem label="视觉调用" value={cost.visionFrames.toString()} />
-          <CostItem label="缓存命中" value={cost.visionCacheHits.toString()} />
-          <CostItem label="输入 token 估算" value={cost.llmInputTokensEst.toString()} />
-          <CostItem label="输出 token 估算" value={cost.llmOutputTokensEst.toString()} />
-          <CostItem label="TTS 字符" value={cost.ttsChars.toString()} />
-          <CostItem label="打断次数" value={cost.interruptions.toString()} />
-          <div className="cost-total">
-            <span>估算成本单位</span>
-            <strong>{cost.estimatedUnits}</strong>
-          </div>
-
-          <div className="pipeline">
-            <div><Wifi size={16} /> WebSocket Gateway</div>
-            <div><Mic size={16} /> Browser ASR fallback</div>
-            <div><Eye size={16} /> Keyframe VL</div>
-            <div><Volume2 size={16} /> Browser TTS</div>
-          </div>
-          {lastError && <div className="error"><WifiOff size={16} /> {lastError}</div>}
-        </aside>
-      </section>
+        </section>
+      </div>
     </main>
   );
 }
 
-function StatusPill({ label, active }: { label: string; active: boolean }) {
-  return <span className={`status-pill ${active ? "active" : ""}`}>{label}</span>;
+function IconSidebar({ activeView, setActiveView }: { activeView: AppView; setActiveView: (view: AppView) => void }) {
+  const items = [
+    { view: "chat" as const, icon: Radio, label: "实时对话" },
+    { view: "cost" as const, icon: BarChart3, label: "模型消耗" },
+    { view: "settings" as const, icon: Settings, label: "用户设置" },
+  ];
+  return (
+    <aside className="flex flex-col items-center gap-6 border-r border-slate-200 bg-slate-950 px-3 py-5 text-white max-lg:hidden">
+      <div className="grid h-11 w-11 place-items-center rounded-2xl bg-cyan-400 text-sm font-black text-slate-950 shadow-soft">AI</div>
+      <nav className="flex flex-col gap-3">
+        {items.map(({ view, icon: Icon, label }) => (
+          <button
+            key={view}
+            className={cx(
+              "grid h-11 w-11 place-items-center rounded-2xl transition",
+              activeView === view ? "bg-white text-slate-950" : "text-slate-400 hover:bg-white/10 hover:text-white",
+            )}
+            onClick={() => setActiveView(view)}
+            title={label}
+          >
+            <Icon size={20} />
+          </button>
+        ))}
+      </nav>
+    </aside>
+  );
 }
 
-function CostItem({ label, value }: { label: string; value: string }) {
+function HistoryRail({
+  collapsed,
+  currentSessionId,
+  onNewSession,
+  onSelectSession,
+  onToggle,
+  sessions,
+}: {
+  collapsed: boolean;
+  currentSessionId: string;
+  onNewSession: () => void;
+  onSelectSession: (id: string) => void;
+  onToggle: () => void;
+  sessions: SessionListItem[];
+}) {
+  if (collapsed) {
+    return (
+      <aside className="flex flex-col items-center gap-3 border-r border-slate-200 bg-slate-100/80 py-4 max-lg:hidden">
+        <button
+          className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50"
+          onClick={onToggle}
+          title="展开历史记录"
+        >
+          <PanelLeftOpen size={18} />
+        </button>
+        <button
+          className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50"
+          onClick={onNewSession}
+          title="新会话"
+        >
+          <Plus size={18} />
+        </button>
+      </aside>
+    );
+  }
+
   return (
-    <div className="cost-item">
-      <span>{label}</span>
-      <strong>{value}</strong>
+    <aside className="border-r border-slate-200 bg-slate-100/80 p-4 max-lg:hidden">
+      <div className="mb-5 flex gap-2">
+        <button className="flex h-11 flex-1 items-center gap-2 rounded-2xl bg-white px-4 text-sm font-bold text-slate-800 shadow-sm" onClick={onNewSession}>
+          <Plus size={17} /> 新会话
+        </button>
+        <button className="grid h-11 w-11 place-items-center rounded-2xl bg-white text-slate-600 shadow-sm hover:bg-slate-50" onClick={onToggle} title="收起历史记录">
+          <PanelLeftClose size={18} />
+        </button>
+      </div>
+      <div className="mb-3 flex items-center gap-2 text-xs font-black uppercase tracking-wide text-slate-500">
+        <History size={15} /> 历史记录
+      </div>
+      <div className="space-y-2">
+        {sessions.length === 0 ? (
+          <p className="rounded-2xl border border-dashed border-slate-300 p-4 text-sm text-slate-500">暂无会话历史</p>
+        ) : (
+          sessions.map((session) => (
+            <button
+              key={session.id}
+              className={cx(
+                "w-full rounded-2xl px-3 py-3 text-left transition",
+                session.id === currentSessionId ? "bg-white text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white",
+              )}
+              onClick={() => onSelectSession(session.id)}
+            >
+              <span className="flex items-center gap-2 text-sm font-black">
+                <MessageSquare size={15} /> {session.title}
+              </span>
+              <span className="mt-1 block text-xs font-semibold text-slate-400">
+                {session.updatedAt} · {session.messageCount} 条消息
+              </span>
+            </button>
+          ))
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function TopBar({
+  activeView,
+  connectionState,
+  mediaState,
+  startSession,
+  stopSession,
+}: {
+  activeView: AppView;
+  connectionState: string;
+  mediaState: string;
+  startSession: () => Promise<void>;
+  stopSession: () => Promise<void>;
+}) {
+  return (
+    <header className="flex min-h-24 items-center justify-between gap-4 border-b border-slate-200 px-8 py-5 max-md:flex-col max-md:items-start max-md:px-4">
+      <div>
+        <h1 className="text-2xl font-black tracking-tight">
+          {activeView === "chat" ? "AI 视觉对话助手" : activeView === "cost" ? "模型消耗中转站" : "用户设置"}
+        </h1>
+        <p className="mt-1 text-sm font-semibold text-slate-500">Tailwind UI · WebSocket Gateway · Pipecat-ready Pipeline · 视觉关键帧</p>
+      </div>
+      <div className="flex items-center gap-3">
+        <StatusPill label={connectionState === "open" ? "Gateway 已连接" : "Gateway 未连接"} active={connectionState === "open"} />
+        {mediaState !== "running" ? (
+          <button className="inline-flex h-11 items-center gap-2 rounded-2xl bg-emerald-700 px-5 font-bold text-white hover:bg-emerald-800" onClick={() => void startSession()}>
+            <Play size={18} /> 启动会话
+          </button>
+        ) : (
+          <button className="inline-flex h-11 items-center gap-2 rounded-2xl bg-rose-600 px-5 font-bold text-white hover:bg-rose-700" onClick={() => void stopSession()}>
+            <CircleStop size={18} /> 停止
+          </button>
+        )}
+      </div>
+    </header>
+  );
+}
+
+function PermissionBanner({ permissionStatus, startSession }: { permissionStatus: string; startSession: () => Promise<void> }) {
+  return (
+    <div className="mb-4 flex items-center justify-between gap-4 rounded-3xl border border-amber-200 bg-amber-50 px-5 py-4 text-amber-950 shadow-sm max-md:flex-col max-md:items-start">
+      <div className="flex items-center gap-3">
+        <div className="grid h-10 w-10 place-items-center rounded-2xl bg-amber-200">
+          <Shield size={20} />
+        </div>
+        <div>
+          <strong className="block text-sm">需要摄像头与麦克风权限</strong>
+          <span className="text-sm text-amber-800">{permissionStatus}。点击请求后浏览器会弹出权限提示。</span>
+        </div>
+      </div>
+      <button className="rounded-2xl bg-amber-900 px-4 py-2 text-sm font-bold text-white" onClick={() => void startSession()}>
+        请求权限
+      </button>
     </div>
   );
+}
+
+function ChatView(props: {
+  aiState: AiState;
+  canSend: boolean;
+  captureFrame: (reason: string, force?: boolean) => Promise<boolean>;
+  handleComposerAction: () => void;
+  isProcessing: boolean;
+  level: number;
+  manualText: string;
+  messages: ChatMessage[];
+  partial: string;
+  setManualText: (text: string) => void;
+  sendManual: () => Promise<void>;
+  videoRef: React.RefObject<HTMLVideoElement | null>;
+  canvasRef: React.RefObject<HTMLCanvasElement | null>;
+  sampleRef: React.RefObject<HTMLCanvasElement | null>;
+  videoPanePercent: number;
+  setVideoPanePercent: (value: number) => void;
+}) {
+  const {
+    aiState,
+    canSend,
+    captureFrame,
+    handleComposerAction,
+    isProcessing,
+    level,
+    manualText,
+    messages,
+    partial,
+    setManualText,
+    sendManual,
+    videoRef,
+    canvasRef,
+    sampleRef,
+    videoPanePercent,
+    setVideoPanePercent,
+  } = props;
+  const messageScrollerRef = useRef<HTMLDivElement | null>(null);
+  const gridRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const element = messageScrollerRef.current;
+    if (!element) return;
+    element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+  }, [isProcessing, messages, partial]);
+
+  const beginPaneResize = useCallback(
+    (event: React.PointerEvent<HTMLButtonElement>) => {
+      const grid = gridRef.current;
+      if (!grid) return;
+      event.preventDefault();
+      const rect = grid.getBoundingClientRect();
+      const handleMove = (moveEvent: PointerEvent) => {
+        const next = ((moveEvent.clientX - rect.left) / rect.width) * 100;
+        setVideoPanePercent(Math.min(68, Math.max(42, next)));
+      };
+      const handleUp = () => {
+        window.removeEventListener("pointermove", handleMove);
+        window.removeEventListener("pointerup", handleUp);
+      };
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", handleUp);
+    },
+    [setVideoPanePercent],
+  );
+
+  return (
+    <section
+      ref={gridRef}
+      className="grid gap-5 xl:grid-cols-[minmax(320px,var(--video-fr))_12px_minmax(360px,var(--chat-fr))]"
+      style={
+        {
+          "--video-fr": `${videoPanePercent}fr`,
+          "--chat-fr": `${100 - videoPanePercent}fr`,
+        } as React.CSSProperties
+      }
+    >
+      <div className="min-w-0">
+        <div className="relative aspect-[4/3] overflow-hidden rounded-3xl border border-slate-200 bg-slate-900 shadow-soft">
+          <video ref={videoRef} playsInline muted className="h-full w-full object-cover" />
+          <canvas ref={canvasRef} hidden />
+          <canvas ref={sampleRef} hidden />
+          <AiStatusIndicator state={aiState} />
+          <div className="absolute inset-x-4 bottom-4 flex items-center justify-between gap-3">
+            <span className="inline-flex h-10 items-center gap-2 rounded-2xl bg-slate-950/70 px-4 text-sm font-bold text-white backdrop-blur">
+              <Camera size={16} /> 关键帧模式
+            </span>
+            <button className="inline-flex h-10 items-center gap-2 rounded-2xl bg-white/90 px-4 text-sm font-bold text-slate-800" onClick={() => void captureFrame("manual", true)}>
+              <Eye size={16} /> 抓取画面
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <button
+        className="hidden cursor-col-resize rounded-full bg-slate-200 transition hover:bg-slate-300 xl:block"
+        onPointerDown={beginPaneResize}
+        title="拖拽调整视频和对话宽度"
+      />
+
+      <div className="flex min-h-[720px] min-w-0 flex-col rounded-3xl border border-slate-200 bg-white shadow-soft">
+        <div className="flex min-h-16 items-center justify-between border-b border-slate-200 px-5">
+          <div className="flex items-center gap-2 font-black"><Radio size={18} /> 实时对话</div>
+          {partial && <div className="max-w-[52%] truncate rounded-full bg-cyan-50 px-3 py-1 text-sm font-bold text-cyan-700">正在听：{partial}</div>}
+        </div>
+        <div ref={messageScrollerRef} className="flex-1 space-y-5 overflow-auto px-6 py-6">
+          {messages.map((message) => {
+            if (message.role === "assistant" && !message.text.trim()) return null;
+            return <MessageBubble key={message.id} message={message} />;
+          })}
+        </div>
+        <Composer
+          canSend={canSend}
+          handleComposerAction={handleComposerAction}
+          isProcessing={isProcessing}
+          level={level}
+          manualText={manualText}
+          sendManual={sendManual}
+          setManualText={setManualText}
+        />
+      </div>
+    </section>
+  );
+}
+
+function MessageBubble({ message }: { message: ChatMessage }) {
+  const isUser = message.role === "user";
+  const isSystem = message.role === "system";
+  return (
+    <article className={cx("flex", isUser ? "justify-end" : "justify-start")}>
+      <div
+        className={cx(
+          "max-w-[78%] rounded-[1.35rem] px-5 py-4 shadow-sm",
+          isUser && "bg-slate-950 text-white",
+          message.role === "assistant" && "bg-white text-slate-900 ring-1 ring-slate-200",
+          isSystem && "max-w-full bg-slate-100 text-slate-700",
+        )}
+      >
+        <span className={cx("mb-2 block text-xs font-black uppercase tracking-wide", isUser ? "text-white/60" : "text-slate-400")}>
+          {message.role === "assistant" ? "AI" : message.role === "user" ? "你" : "系统"}
+        </span>
+        <p className="whitespace-pre-wrap break-words leading-7">
+          {message.text}
+          {message.streaming && message.text ? <span className="ml-1 animate-pulse">▌</span> : null}
+        </p>
+      </div>
+    </article>
+  );
+}
+
+function Composer({
+  canSend,
+  handleComposerAction,
+  isProcessing,
+  level,
+  manualText,
+  sendManual,
+  setManualText,
+}: {
+  canSend: boolean;
+  handleComposerAction: () => void;
+  isProcessing: boolean;
+  level: number;
+  manualText: string;
+  sendManual: () => Promise<void>;
+  setManualText: (text: string) => void;
+}) {
+  return (
+    <div className="border-t border-slate-200 p-4">
+      <div className="rounded-[2rem] border border-slate-200 bg-white p-3 shadow-soft">
+        <textarea
+          className="min-h-16 w-full resize-none border-0 bg-transparent px-3 pt-2 text-base leading-7 text-slate-900 outline-none placeholder:text-slate-400"
+          value={manualText}
+          onChange={(event) => setManualText(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              if (!isProcessing && canSend) void sendManual();
+            }
+          }}
+          placeholder="要求后续变更"
+          rows={2}
+        />
+        <div className="flex items-center gap-3 px-2 pb-1">
+          <button className="grid h-10 w-10 place-items-center rounded-full text-slate-500 hover:bg-slate-100"><Plus size={22} /></button>
+          <div className="ml-auto flex items-center gap-3">
+            <button className="grid h-10 w-10 place-items-center rounded-full text-slate-500 hover:bg-slate-100"><Mic size={21} /></button>
+            <button
+              className={cx(
+                "grid h-12 w-12 place-items-center rounded-full transition",
+                isProcessing && "bg-slate-950 text-white hover:bg-slate-800",
+                !isProcessing && canSend && "bg-slate-900 text-white hover:bg-slate-700",
+                !isProcessing && !canSend && "cursor-not-allowed bg-slate-200 text-slate-400",
+              )}
+              disabled={!isProcessing && !canSend}
+              onClick={handleComposerAction}
+              title={isProcessing ? "中断回复" : "发送"}
+            >
+              {isProcessing ? <Square size={18} /> : <ArrowUp size={23} />}
+            </button>
+          </div>
+        </div>
+        <div className="mt-2 flex items-center gap-3 rounded-2xl bg-slate-50 px-3 py-2">
+          <Mic size={16} className="text-slate-500" />
+          <span className="text-xs font-black text-slate-500">麦克风流</span>
+          <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-200">
+            <span className="block h-full rounded-full bg-emerald-500 transition-all" style={{ width: `${Math.min(level * 900, 100)}%` }} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AiStatusIndicator({ state }: { state: AiState }) {
+  const label = state === "listening" ? "正在倾听" : state === "processing" ? "模型思考中" : state === "speaking" ? "AI 正在说话" : "待机";
+  return (
+    <div className="absolute left-4 top-4 flex items-center gap-3 rounded-3xl bg-slate-950/70 px-4 py-3 text-white backdrop-blur">
+      <div
+        className={cx(
+          "relative grid h-12 w-12 place-items-center rounded-full",
+          state === "listening" && "bg-cyan-500/25",
+          state === "processing" && "bg-gradient-to-br from-cyan-400 via-fuchsia-500 to-amber-300",
+          state === "speaking" && "bg-emerald-500/20",
+          state === "idle" && "bg-slate-500/30",
+        )}
+      >
+        {state === "processing" ? <span className="absolute inset-0 rounded-full bg-gradient-to-r from-cyan-300 via-fuchsia-400 to-amber-300 animate-spin" /> : null}
+        {state === "listening" ? <span className="absolute inset-0 rounded-full bg-cyan-400 opacity-50 animate-ping" /> : null}
+        {state === "speaking" ? (
+          <span className="relative flex h-7 items-center gap-1">
+            {[0, 1, 2, 3].map((item) => (
+              <i key={item} className="block h-6 w-1 rounded-full bg-emerald-300 animate-sound-wave" style={{ animationDelay: `${item * 90}ms` }} />
+            ))}
+          </span>
+        ) : (
+          <span className="relative h-7 w-7 rounded-full bg-slate-950" />
+        )}
+      </div>
+      <div>
+        <strong className="block text-sm">{label}</strong>
+        <small className="text-xs text-white/70">{state === "processing" ? "分析画面与上下文" : state === "speaking" ? "语音输出中" : "实时会话"}</small>
+      </div>
+    </div>
+  );
+}
+
+function CostStation({ cost, connectionState, permissionStatus, asrStatus }: { cost: CostSnapshot; connectionState: string; permissionStatus: string; asrStatus: string }) {
+  return (
+    <section className="space-y-6">
+      <div className="rounded-[2rem] bg-slate-950 p-8 text-white shadow-soft">
+        <span className="text-sm font-bold text-cyan-300">Gateway & Backend</span>
+        <div className="mt-2 flex items-end justify-between gap-4">
+          <div>
+            <h2 className="text-3xl font-black">模型消耗中转站</h2>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">集中观察 ASR、视觉关键帧、LLM token、TTS 字符和缓存命中。</p>
+          </div>
+          <strong className="text-6xl font-black">{cost.estimatedUnits}</strong>
+        </div>
+      </div>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <Metric label="音频总时长" value={`${cost.audioSeconds}s`} />
+        <Metric label="有效语音" value={`${cost.speechSeconds}s`} />
+        <Metric label="音频帧" value={cost.audioChunks.toString()} />
+        <Metric label="视觉调用" value={cost.visionFrames.toString()} />
+        <Metric label="缓存命中" value={cost.visionCacheHits.toString()} />
+        <Metric label="输入 token 估算" value={cost.llmInputTokensEst.toString()} />
+        <Metric label="输出 token 估算" value={cost.llmOutputTokensEst.toString()} />
+        <Metric label="TTS 字符" value={cost.ttsChars.toString()} />
+        <Metric label="打断次数" value={cost.interruptions.toString()} />
+      </div>
+      <div className="grid gap-3 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm md:grid-cols-2">
+        <PipelineItem icon={<Wifi size={16} />} label={`Gateway：${connectionState}`} />
+        <PipelineItem icon={<Camera size={16} />} label={`权限：${permissionStatus}`} />
+        <PipelineItem icon={<Mic size={16} />} label={`ASR：${asrStatus}`} />
+        <PipelineItem icon={<Eye size={16} />} label="Keyframe VL" />
+        <PipelineItem icon={<Volume2 size={16} />} label="Browser TTS" />
+      </div>
+    </section>
+  );
+}
+
+function SettingsView({ gatewayUrl, permissionStatus, asrStatus }: { gatewayUrl: string; permissionStatus: string; asrStatus: string }) {
+  return (
+    <section className="max-w-3xl rounded-[2rem] border border-slate-200 bg-white p-7 shadow-soft">
+      <h2 className="text-2xl font-black">用户设置</h2>
+      <div className="mt-6 grid gap-4">
+        <ReadonlyField label="Gateway 地址" value={gatewayUrl} />
+        <ReadonlyField label="权限状态" value={permissionStatus} />
+        <ReadonlyField label="语音识别" value={asrStatus} />
+      </div>
+    </section>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+      <span className="text-sm font-bold text-slate-500">{label}</span>
+      <strong className="mt-3 block text-3xl font-black text-slate-950">{value}</strong>
+    </div>
+  );
+}
+
+function PipelineItem({ icon, label }: { icon: React.ReactNode; label: string }) {
+  return <div className="flex min-h-12 items-center gap-3 rounded-2xl bg-slate-100 px-4 text-sm font-black text-slate-700">{icon}{label}</div>;
+}
+
+function ReadonlyField({ label, value }: { label: string; value: string }) {
+  return (
+    <label className="grid gap-2 text-sm font-bold text-slate-600">
+      {label}
+      <input className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none" value={value} readOnly />
+    </label>
+  );
+}
+
+function StatusPill({ label, active }: { label: string; active: boolean }) {
+  return <span className={cx("rounded-full px-4 py-2 text-sm font-black", active ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-500")}>{label}</span>;
 }

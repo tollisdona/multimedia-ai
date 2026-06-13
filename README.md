@@ -11,9 +11,10 @@
   - 关键帧抽取、画面变化检测
   - LLM 流式文本展示
   - 浏览器 SpeechSynthesis 准流式 TTS
-- `backend`: FastAPI + WebSocket
+- `backend`: FastAPI + WebSocket + Pipecat-compatible conversation pipeline
   - 自建 Gateway 长连接
   - 流式事件协议
+  - Pipecat-ready 对话 pipeline，集中处理 LLM streaming、TTS chunk、history 和 cancel
   - OpenAI-compatible LLM/VL 适配
   - mock fallback，未配置 API Key 也可演示
   - 会话级成本统计、缓存命中、打断取消
@@ -29,6 +30,10 @@ source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
+
+Pipecat native modules require Python 3.10+. If you run on Python 3.9, the app
+still works through the built-in Pipecat-compatible adapter, but `session.ready`
+will report `pipeline.mode=pipecat-compatible-adapter`.
 
 Frontend:
 
@@ -83,6 +88,21 @@ Gateway to Client:
 - `speech.cancelled`
 - `session.cost`
 - `error`
+
+## Conversation Pipeline
+
+The backend conversation logic now lives in `backend/app/conversation_pipeline.py`.
+The WebSocket Gateway is only responsible for transport and session events;
+the pipeline owns:
+
+- LLM token streaming
+- sentence-level TTS chunking
+- assistant history updates
+- cost snapshots
+- cancellation boundaries
+
+This keeps the existing browser protocol stable while making the backend ready
+to swap in native Pipecat processors/transports on Python 3.10+.
 
 ## Design Document
 

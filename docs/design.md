@@ -14,7 +14,8 @@
 当前实现：
 
 - 已实现摄像头/麦克风授权与预览。
-- 已实现 WebSocket Gateway 长连接与流式事件协议。
+  - 已实现 WebSocket Gateway 长连接与流式事件协议。
+  - 已将对话编排抽象为 Pipecat-compatible conversation pipeline。
 - 已实现 AudioWorklet 音频分片上传，默认约 40ms 一帧。
 - 已实现浏览器 Web Speech API 低成本转写兜底，并通过 Gateway 回推 `asr.partial` / `asr.final`。
 - 已实现 LLM token 流式输出；未配置云模型时使用 mock streaming。
@@ -28,8 +29,8 @@
 
 - 麦克风音频：全流式上传到 Gateway，用于 VAD、成本统计和未来服务端 ASR。
 - ASR：默认使用浏览器 Web Speech API 低成本兜底，结果仍通过 Gateway 标准化回推。
-- LLM：后端使用 OpenAI-compatible streaming 接口；无 Key 时使用 mock stream。
-- TTS：首版使用浏览器 SpeechSynthesis，后端按短句发送 `tts.audio.chunk`。
+- LLM：后端通过 conversation pipeline 使用 OpenAI-compatible streaming 接口；无 Key 时使用 mock stream。
+- TTS：conversation pipeline 按短句发送 `tts.audio.chunk`，首版使用浏览器 SpeechSynthesis 播放。
 - 视频：只上传关键帧，触发条件包括视觉关键词、画面变化、时间间隔。
 
 ```mermaid
@@ -44,7 +45,8 @@ flowchart LR
   Browser <--> Gateway
   Gateway --> ASR
   Gateway --> Vision
-  Gateway --> LLM
+  Gateway --> Pipe["Pipecat-compatible Conversation Pipeline"]
+  Pipe --> LLM
   Gateway --> Cost
   Gateway --> Browser
 ```
@@ -78,6 +80,7 @@ flowchart LR
 - WebSocket 连接以 session 为单位。
 - Gateway 不存放长期用户数据。
 - 模型服务通过适配层隔离，未来可拆为独立 ASR/VL/LLM/TTS 服务。
+- 对话服务通过 `ConversationPipeline` 隔离，未来可替换为 Pipecat native processors。
 - 成本与限流状态集中在 session cost state；生产可迁移到 Redis。
 - GPU 推理服务可独立扩容，不让 Gateway 处理重计算。
 
@@ -98,3 +101,15 @@ flowchart LR
 - TTS：浏览器 SpeechSynthesis；后续接 CosyVoice/GPT-SoVITS chunk。
 
 该设计避免依赖 OpenAI Realtime 或一体化视频对话 API，重点展示实时协议、模型编排和成本控制。
+
+## 6. Pipecat 改造说明
+
+本次改造采用 Pipecat-compatible pipeline 层，而不是继续把所有逻辑堆在 Gateway 中：
+
+- `gateway-service`：只负责 WebSocket transport、事件路由、会话生命周期。
+- `conversation-pipeline`：负责 LLM 流式输出、TTS 分句、历史记录、成本快照、取消边界。
+- `vision-service`：继续负责关键帧理解和缓存。
+
+当前本机 Python 为 3.9，Pipecat 原生模块使用 Python 3.10+ 类型语法，因此运行时会报告
+`pipeline.mode=pipecat-compatible-adapter`。在 Python 3.10+ 环境中可进一步将该 pipeline
+替换为 Pipecat native `Pipeline/Task/Transport`，前端协议无需变化。

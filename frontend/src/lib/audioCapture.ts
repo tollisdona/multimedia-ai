@@ -14,12 +14,10 @@ export class AudioCapture {
   private source: MediaStreamAudioSourceNode | null = null;
   private worklet: AudioWorkletNode | null = null;
   private seq = 0;
-  private lastInterruptAt = 0;
 
   constructor(
     private readonly client: GatewayClient,
     private readonly onLevel: (rms: number) => void,
-    private readonly shouldInterrupt: () => boolean,
   ) {}
 
   async start(stream: MediaStream) {
@@ -35,11 +33,6 @@ export class AudioCapture {
         durationMs: number;
       };
       this.onLevel(rms);
-      const now = performance.now();
-      if (rms > 0.06 && this.shouldInterrupt() && now - this.lastInterruptAt > 900) {
-        this.client.send("speech.cancel", { reason: "barge_in" });
-        this.lastInterruptAt = now;
-      }
       this.client.send("audio.input.chunk", {
         seq: this.seq,
         sampleRate,

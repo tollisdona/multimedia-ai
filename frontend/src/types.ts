@@ -30,7 +30,7 @@ export interface VisionSummary {
 }
 
 export type GatewayEvent =
-  | { type: "session.ready"; sessionId: string; capabilities: Record<string, string> }
+  | { type: "session.ready"; sessionId: string; capabilities: Record<string, unknown> }
   | { type: "session.started"; sessionId: string }
   | { type: "asr.partial"; text: string }
   | { type: "asr.final"; text: string }

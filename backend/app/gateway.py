@@ -7,7 +7,8 @@ from typing import Any
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from .ai import analyze_vision, estimate_tokens, sentence_chunks, stream_llm
+from .ai import analyze_vision
+from .conversation_pipeline import ConversationPipeline, pipecat_runtime_status
 from .models import SessionState, event
 
 
@@ -15,6 +16,7 @@ class GatewayConnection:
     def __init__(self, websocket: WebSocket) -> None:
         self.websocket = websocket
         self.session = SessionState()
+        self.pipeline = ConversationPipeline(self.session)
         self.generation_task: asyncio.Task[None] | None = None
         self.send_lock = asyncio.Lock()
 
@@ -33,9 +35,10 @@ class GatewayConnection:
             capabilities={
                 "audioInput": "pcm16-json-chunks",
                 "asr": "browser-fallback-through-gateway",
-                "llm": "openai-compatible-stream-or-mock",
+                "llm": "pipecat-compatible-pipeline-openai-compatible-stream-or-mock",
                 "tts": "browser-speech-synthesis",
                 "vision": "keyframe-vl-or-mock",
+                "pipeline": pipecat_runtime_status(),
             },
         )
         await self.send_cost()
@@ -129,30 +132,9 @@ class GatewayConnection:
         self.generation_task = None
 
     async def generate_response(self, user_text: str) -> None:
-        answer = ""
-        tts_buffer = ""
         try:
-            async for delta in stream_llm(self.session, user_text):
-                answer += delta
-                tts_buffer += delta
-                self.session.cost.llm_output_tokens_est += estimate_tokens(delta)
-                await self.send("llm.delta", delta=delta)
-
-                chunks, tts_buffer = sentence_chunks(tts_buffer)
-                for chunk in chunks:
-                    self.session.cost.tts_chars += len(chunk)
-                    await self.send("tts.audio.chunk", mode="browser-speech", text=chunk)
-                    await self.send_cost()
-
-            tail = tts_buffer.strip()
-            if tail:
-                self.session.cost.tts_chars += len(tail)
-                await self.send("tts.audio.chunk", mode="browser-speech", text=tail)
-
-            if answer.strip():
-                self.session.history.append({"role": "assistant", "content": answer.strip()})
-            await self.send("llm.done", cancelled=False)
-            await self.send_cost()
+            async for pipeline_event in self.pipeline.run_user_turn(user_text):
+                await self.send(pipeline_event.type, **pipeline_event.payload)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

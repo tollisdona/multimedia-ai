@@ -14,7 +14,7 @@ from .config import settings
 from .models import SessionState, VisionSummary, now_ms
 
 
-SENTENCE_RE = re.compile(r"([^。！？!?；;\n]{8,}[。！？!?；;，,]?|[^。！？!?；;\n]{18,})")
+SENTENCE_RE = re.compile(r"(.+?[。！？!?；;])")
 
 
 def estimate_tokens(text: str) -> int:
@@ -186,10 +186,17 @@ def sentence_chunks(buffer: str) -> tuple[list[str], str]:
     start = 0
     for match in SENTENCE_RE.finditer(buffer):
         chunk = match.group(0).strip()
-        if len(chunk) >= 8:
+        if len(chunk) >= 6:
             chunks.append(chunk)
             start = match.end()
-    return chunks, buffer[start:]
+    rest = buffer[start:]
+    while len(rest) >= 42:
+        split_at = max(rest.rfind("，", 0, 42), rest.rfind(",", 0, 42))
+        if split_at < 12:
+            split_at = 42
+        chunks.append(rest[: split_at + 1].strip())
+        rest = rest[split_at + 1 :]
+    return chunks, rest
 
 
 def validate_audio_payload(payload: str) -> bool:
