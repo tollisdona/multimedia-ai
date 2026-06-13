@@ -59,6 +59,14 @@ class VisionSummary:
 
 
 @dataclass
+class FrameSnapshot:
+    data_url: str
+    reason: str
+    frame_hash: str
+    captured_at: int
+
+
+@dataclass
 class SessionState:
     session_id: str = field(default_factory=lambda: str(uuid4()))
     user_id: str = ""
@@ -66,6 +74,7 @@ class SessionState:
     created_at: int = field(default_factory=now_ms)
     latest_transcript: str = ""
     latest_vision: VisionSummary = field(default_factory=VisionSummary)
+    recent_frames: list[FrameSnapshot] = field(default_factory=list)
     history: list[dict[str, str]] = field(default_factory=list)
     cost: CostState = field(default_factory=CostState)
     cancelled_generation: bool = False

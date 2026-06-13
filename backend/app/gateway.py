@@ -7,10 +7,11 @@ from typing import Any
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from .ai import analyze_vision
+from .ai import analyze_vision, frame_hash
+from .config import settings
 from .conversation_pipeline import ConversationPipeline, pipecat_runtime_status
 from .db import append_message, save_cost_snapshot, save_vision_summary
-from .models import SessionState, event
+from .models import FrameSnapshot, SessionState, VisionSummary, event, now_ms
 
 
 class GatewayConnection:
@@ -38,9 +39,9 @@ class GatewayConnection:
             capabilities={
                 "audioInput": "pcm16-json-chunks",
                 "asr": "browser-fallback-through-gateway",
-                "llm": "pipecat-compatible-pipeline-openai-compatible-stream-or-mock",
+                "llm": "qwen-omni-direct-frame-stream-or-openai-compatible-fallback",
                 "tts": "browser-speech-synthesis",
-                "vision": "keyframe-vl-or-mock",
+                "vision": "keyframe-buffer-qwen-omni-direct-or-vl-summary-fallback",
                 "pipeline": pipecat_runtime_status(),
             },
         )
@@ -94,6 +95,47 @@ class GatewayConnection:
         reason = str(message.get("reason", "periodic"))
         if not data_url.startswith("data:image/"):
             await self.send("error", code="invalid_frame", message="vision.frame requires data:image URL")
+            return
+
+        image_hash = frame_hash(data_url)
+        self.session.recent_frames.append(
+            FrameSnapshot(data_url=data_url, reason=reason, frame_hash=image_hash, captured_at=now_ms())
+        )
+        self.session.recent_frames = self.session.recent_frames[-4:]
+
+        if settings.omni_api_key:
+            summary = VisionSummary(
+                summary="已缓存当前摄像头关键帧。下一轮视觉相关回答会将原始图像直接交给 Qwen-Omni 分析，而不是只依赖文字摘要。",
+                objects=[],
+                text_seen="",
+                confidence=0.9,
+                frame_hash=image_hash,
+                updated_at=now_ms(),
+                source=f"{settings.resolved_omni_chat_model}-frame-buffer",
+            )
+            self.session.latest_vision = summary
+            save_vision_summary(
+                self.session.user_id,
+                self.session.conversation_id,
+                {
+                    "summary": summary.summary,
+                    "objects": summary.objects,
+                    "textSeen": summary.text_seen,
+                    "confidence": summary.confidence,
+                    "source": summary.source,
+                    "reason": reason,
+                },
+            )
+            await self.send(
+                "vision.summary",
+                summary=summary.summary,
+                objects=summary.objects,
+                textSeen=summary.text_seen,
+                confidence=summary.confidence,
+                source=summary.source,
+                reason=reason,
+            )
+            await self.send_cost()
             return
 
         previous_hash = self.session.latest_vision.frame_hash

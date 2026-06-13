@@ -119,6 +119,15 @@ def system_prompt() -> str:
     )
 
 
+def omni_system_prompt() -> str:
+    return (
+        "你是一个实时视频通话中的 AI 视觉对话助手。"
+        "你会直接观察用户摄像头关键帧，并结合最近对话自然回答。"
+        "优先根据图像证据回答，不要只依赖旧摘要；如果看不清、画面裁切、反光或信息不足，要明确说明不确定。"
+        "回答要简洁、口语化，适合直接朗读。"
+    )
+
+
 def build_messages(session: SessionState, user_text: str) -> list[dict[str, str]]:
     vision = session.latest_vision
     context = (
@@ -136,7 +145,79 @@ def build_messages(session: SessionState, user_text: str) -> list[dict[str, str]
     ]
 
 
+def build_omni_messages(session: SessionState, user_text: str) -> list[dict[str, Any]]:
+    recent = session.history[-8:]
+    if not session.recent_frames:
+        return [
+            {"role": "system", "content": omni_system_prompt()},
+            *recent,
+            {"role": "user", "content": user_text},
+        ]
+
+    latest_frame = session.recent_frames[-1]
+    visual_instruction = (
+        "请直接观察这张最新摄像头关键帧来回答用户问题。"
+        f"关键帧触发原因：{latest_frame.reason}。"
+        "不要把视觉摘要当成唯一依据；如果图中没有足够证据，请说明。"
+    )
+    return [
+        {"role": "system", "content": omni_system_prompt()},
+        *recent,
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{visual_instruction}\n用户问题：{user_text}"},
+                {"type": "image_url", "image_url": {"url": latest_frame.data_url, "detail": "auto"}},
+            ],
+        },
+    ]
+
+
+async def stream_qwen_omni(session: SessionState, user_text: str) -> AsyncIterator[str]:
+    messages = build_omni_messages(session, user_text)
+    text_for_estimate = "\n".join(
+        item["content"] if isinstance(item.get("content"), str) else json.dumps(item.get("content"), ensure_ascii=False)
+        for item in messages
+    )
+    session.cost.llm_input_tokens_est += estimate_tokens(text_for_estimate)
+
+    payload = {
+        "model": settings.resolved_omni_chat_model,
+        "messages": messages,
+        "modalities": ["text"],
+        "stream": True,
+        "temperature": 0.35,
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.omni_api_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream(
+            "POST", f"{settings.omni_base_url}/chat/completions", headers=headers, json=payload
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                raw = line.removeprefix("data: ").strip()
+                if raw == "[DONE]":
+                    break
+                try:
+                    choice = json.loads(raw)["choices"][0]
+                    delta = choice.get("delta", {}).get("content", "")
+                except (KeyError, json.JSONDecodeError, IndexError, TypeError):
+                    continue
+                if isinstance(delta, str) and delta:
+                    yield delta
+
+
 async def stream_llm(session: SessionState, user_text: str) -> AsyncIterator[str]:
+    if settings.omni_api_key:
+        async for delta in stream_qwen_omni(session, user_text):
+            yield delta
+        return
+
     messages = build_messages(session, user_text)
     session.cost.llm_input_tokens_est += estimate_tokens("\n".join(m["content"] for m in messages))
 
