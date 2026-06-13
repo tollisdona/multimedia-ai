@@ -40,6 +40,9 @@ import type { ChatMessage, CostSnapshot, GatewayEvent } from "./types";
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
 const SPEECH_AUTO_SEND_DELAY_MS = 1200;
 const DUPLICATE_SPEECH_WINDOW_MS = 1800;
+const VOICE_STORAGE_KEY = "ai-vision-realtime-voice";
+const realtimeVoices = ["Cherry", "Serena", "Ethan", "Chelsie"] as const;
+type RealtimeVoice = (typeof realtimeVoices)[number];
 
 const emptyCost: CostSnapshot = {
   audioSeconds: 0,
@@ -82,6 +85,11 @@ function timeLabel(timestamp = Date.now()) {
 
 function createStarterMessages(): ChatMessage[] {
   return [{ id: uid(), role: "system", text: "混合流式助手已就绪：音频全流式、文本流式、视觉关键帧准实时。" }];
+}
+
+function loadStoredVoice(): RealtimeVoice {
+  const stored = localStorage.getItem(VOICE_STORAGE_KEY);
+  return realtimeVoices.includes(stored as RealtimeVoice) ? (stored as RealtimeVoice) : "Cherry";
 }
 
 function gatewayUrlWithToken(url: string, token?: string, conversationId?: string) {
@@ -168,6 +176,7 @@ export function App() {
   const [asrStatus, setAsrStatus] = useState("未启动");
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [aiState, setAiState] = useState<AiState>("idle");
+  const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(() => loadStoredVoice());
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [videoPanePercent, setVideoPanePercent] = useState(57.14);
   const [conversationsLoaded, setConversationsLoaded] = useState(false);
@@ -519,6 +528,7 @@ export function App() {
         stopSpeech();
         finishAssistant(true);
       }
+      if (event.type === "voice.updated") setSelectedVoice(event.voice as RealtimeVoice);
       if (event.type === "session.cost") setCost(event.cost);
       if (event.type === "error") setLastError(`${event.code}: ${event.message}`);
     },
@@ -676,6 +686,7 @@ export function App() {
       client.connect();
       await client.waitOpen();
       client.send("session.start");
+      client.send("session.voice.update", { voice: selectedVoice });
 
       const audioCapture = new AudioCapture(client, setLevel);
       await audioCapture.start(grantedStream);
@@ -702,7 +713,7 @@ export function App() {
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, startSpeechRecognition]);
+  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, selectedVoice, startSpeechRecognition]);
 
   const stopSession = useCallback(async () => {
     runningRef.current = false;
@@ -800,6 +811,15 @@ export function App() {
     setAuthError("");
   }, [stopSession]);
 
+  const updateVoice = useCallback(
+    (voice: RealtimeVoice) => {
+      setSelectedVoice(voice);
+      localStorage.setItem(VOICE_STORAGE_KEY, voice);
+      if (client.state === "open") client.send("session.voice.update", { voice });
+    },
+    [client],
+  );
+
   if (!authSession) {
     return <AuthView apiBaseUrl={apiBaseUrl} error={authError} onAuthenticated={handleAuthenticated} />;
   }
@@ -872,6 +892,8 @@ export function App() {
                 gatewayUrl={gatewayUrl}
                 permissionStatus={permissionStatus}
                 asrStatus={asrStatus}
+                selectedVoice={selectedVoice}
+                setSelectedVoice={updateVoice}
                 user={authSession.user}
                 onLogout={logout}
               />
@@ -1416,12 +1438,16 @@ function SettingsView({
   gatewayUrl,
   permissionStatus,
   asrStatus,
+  selectedVoice,
+  setSelectedVoice,
   user,
   onLogout,
 }: {
   gatewayUrl: string;
   permissionStatus: string;
   asrStatus: string;
+  selectedVoice: RealtimeVoice;
+  setSelectedVoice: (voice: RealtimeVoice) => void;
   user: AuthSession["user"];
   onLogout: () => Promise<void>;
 }) {
@@ -1441,6 +1467,25 @@ function SettingsView({
         <ReadonlyField label="Gateway 地址" value={gatewayUrl} />
         <ReadonlyField label="权限状态" value={permissionStatus} />
         <ReadonlyField label="语音识别" value={asrStatus} />
+        <div className="rounded-2xl bg-slate-50 px-4 py-3">
+          <span className="text-xs font-black text-slate-400">Realtime 音色</span>
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {realtimeVoices.map((voice) => (
+              <button
+                key={voice}
+                className={cx(
+                  "h-10 rounded-2xl text-sm font-black transition",
+                  selectedVoice === voice ? "bg-slate-950 text-white" : "bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-100",
+                )}
+                onClick={() => setSelectedVoice(voice)}
+                type="button"
+              >
+                {voice}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-xs font-semibold text-slate-500">音色会保存到本机，并在会话启动或切换时同步给 Realtime Gateway。</p>
+        </div>
       </div>
     </section>
   );

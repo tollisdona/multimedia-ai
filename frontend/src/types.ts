@@ -30,5 +30,6 @@ export type GatewayEvent =
   | { type: "llm.done"; cancelled: boolean }
   | { type: "tts.audio.chunk"; mode: "browser-speech"; text: string }
   | { type: "speech.cancelled"; reason: string }
+  | { type: "voice.updated"; voice: string; provider: string }
   | { type: "session.cost"; cost: CostSnapshot }
   | { type: "error"; code: string; message: string };
