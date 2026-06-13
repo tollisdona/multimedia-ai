@@ -16,7 +16,6 @@ export interface PersistedConversation {
   createdAt: number;
   updatedAt: number;
   messageCount: number;
-  latestVision: Record<string, unknown>;
   latestCost: Record<string, unknown>;
 }
 

@@ -20,21 +20,12 @@ export interface CostSnapshot {
   estimatedUnits: number;
 }
 
-export interface VisionSummary {
-  summary: string;
-  objects: string[];
-  textSeen: string;
-  confidence: number;
-  source: string;
-  reason: string;
-}
-
 export type GatewayEvent =
   | { type: "session.ready"; sessionId: string; capabilities: Record<string, unknown> }
   | { type: "session.started"; sessionId: string }
   | { type: "asr.partial"; text: string }
   | { type: "asr.final"; text: string }
-  | { type: "vision.summary"; summary: string; objects: string[]; textSeen: string; confidence: number; source: string; reason: string }
+  | { type: "vision.frame.cached"; reason: string; frameHash: string; reused: boolean; bufferedFrames: number }
   | { type: "llm.delta"; delta: string }
   | { type: "llm.done"; cancelled: boolean }
   | { type: "tts.audio.chunk"; mode: "browser-speech"; text: string }

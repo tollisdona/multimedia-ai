@@ -7,10 +7,11 @@ from typing import Any
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from .ai import analyze_vision
+from .ai import frame_hash
 from .conversation_pipeline import ConversationPipeline, pipecat_runtime_status
-from .db import append_message, save_cost_snapshot, save_vision_summary
-from .models import SessionState, event
+from .db import append_message, save_cost_snapshot
+from .models import FrameSnapshot, SessionState, event, now_ms
+from .realtime import QwenRealtimeProvider, realtime_available
 
 
 class GatewayConnection:
@@ -20,6 +21,16 @@ class GatewayConnection:
         self.pipeline = ConversationPipeline(self.session)
         self.generation_task: asyncio.Task[None] | None = None
         self.send_lock = asyncio.Lock()
+        self.realtime = (
+            QwenRealtimeProvider(
+                self.session,
+                self.send_provider_event,
+                self.record_realtime_user_transcript,
+                self.record_realtime_assistant_transcript,
+            )
+            if realtime_available()
+            else None
+        )
 
     async def send(self, event_type: str, **payload: Any) -> None:
         async with self.send_lock:
@@ -37,10 +48,11 @@ class GatewayConnection:
             protocolVersion="1.0",
             capabilities={
                 "audioInput": "pcm16-json-chunks",
-                "asr": "browser-fallback-through-gateway",
-                "llm": "pipecat-compatible-pipeline-openai-compatible-stream-or-mock",
-                "tts": "browser-speech-synthesis",
-                "vision": "keyframe-vl-or-mock",
+                "asr": "qwen-realtime-asr" if self.realtime else "browser-fallback-through-gateway",
+                "llm": "direct-multimodal-frame-answer-stream-or-mock",
+                "tts": "qwen-omni-realtime-audio-stream" if self.realtime else "browser-speech-synthesis",
+                "vision": "keyframe-buffer-realtime-window" if self.realtime else "keyframe-buffer-direct-answer-no-summary",
+                "realtime": bool(self.realtime),
                 "pipeline": pipecat_runtime_status(),
             },
         )
@@ -54,6 +66,9 @@ class GatewayConnection:
                 await self.handle(message)
         except WebSocketDisconnect:
             await self.cancel_generation(silent=True)
+        finally:
+            if self.realtime:
+                await self.realtime.close()
 
     async def handle(self, message: dict[str, Any]) -> None:
         message_type = message.get("type")
@@ -76,6 +91,8 @@ class GatewayConnection:
             self.session.cost.interruptions += 1
             await self.send("speech.cancelled", reason=message.get("reason", "user_interrupt"))
             await self.send_cost()
+        elif message_type == "session.voice.update":
+            await self.handle_voice_update(message)
         else:
             await self.send("error", code="unknown_event", message=f"Unknown event: {message_type}")
 
@@ -86,6 +103,13 @@ class GatewayConnection:
         self.session.cost.audio_ms += max(0, min(duration_ms, 200))
         if rms > 0.012:
             self.session.cost.speech_ms += max(0, min(duration_ms, 200))
+        if self.realtime:
+            audio = str(message.get("audio", ""))
+            if audio:
+                try:
+                    await self.realtime.append_audio(audio)
+                except Exception as exc:
+                    await self.send("error", code="realtime_audio_failed", message=str(exc))
         if self.session.cost.audio_chunks % 25 == 0:
             await self.send_cost()
 
@@ -96,43 +120,45 @@ class GatewayConnection:
             await self.send("error", code="invalid_frame", message="vision.frame requires data:image URL")
             return
 
-        previous_hash = self.session.latest_vision.frame_hash
-        try:
-            summary = await analyze_vision(data_url, reason, previous_hash)
-        except Exception as exc:
-            await self.send("error", code="vision_failed", message=str(exc))
-            return
-        if summary.source == "cache":
+        image_hash = frame_hash(data_url)
+        reused = bool(self.session.recent_frames and self.session.recent_frames[-1].frame_hash == image_hash)
+        if reused:
             self.session.cost.vision_cache_hits += 1
-            summary.summary = self.session.latest_vision.summary
-            summary.objects = self.session.latest_vision.objects
-            summary.text_seen = self.session.latest_vision.text_seen
-            summary.confidence = max(summary.confidence, self.session.latest_vision.confidence)
         else:
-            self.session.cost.vision_frames += 1
-        self.session.latest_vision = summary
-        save_vision_summary(
-            self.session.user_id,
-            self.session.conversation_id,
-            {
-                "summary": summary.summary,
-                "objects": summary.objects,
-                "textSeen": summary.text_seen,
-                "confidence": summary.confidence,
-                "source": summary.source,
-                "reason": reason,
-            },
-        )
+            self.session.recent_frames.append(
+                FrameSnapshot(data_url=data_url, reason=reason, frame_hash=image_hash, captured_at=now_ms())
+            )
+            cutoff = now_ms() - 10000
+            self.session.recent_frames = [
+                frame for frame in self.session.recent_frames if frame.captured_at >= cutoff
+            ][-4:]
+            if self.realtime:
+                try:
+                    await self.realtime.append_image(data_url)
+                except Exception as exc:
+                    await self.send("error", code="realtime_image_failed", message=str(exc))
+
         await self.send(
-            "vision.summary",
-            summary=summary.summary,
-            objects=summary.objects,
-            textSeen=summary.text_seen,
-            confidence=summary.confidence,
-            source=summary.source,
+            "vision.frame.cached",
             reason=reason,
+            frameHash=image_hash,
+            reused=reused,
+            bufferedFrames=len(self.session.recent_frames),
         )
         await self.send_cost()
+
+    async def handle_voice_update(self, message: dict[str, Any]) -> None:
+        voice = str(message.get("voice", "")).strip()
+        if not voice:
+            await self.send("error", code="invalid_voice", message="voice is required")
+            return
+        if not self.realtime:
+            await self.send("voice.updated", voice=voice, provider="browser-fallback")
+            return
+        try:
+            await self.realtime.update_session(voice)
+        except Exception as exc:
+            await self.send("error", code="voice_update_failed", message=str(exc))
 
     async def handle_final_transcript(self, text: str) -> None:
         await self.cancel_generation(silent=True)
@@ -143,6 +169,8 @@ class GatewayConnection:
         self.generation_task = asyncio.create_task(self.generate_response(text))
 
     async def cancel_generation(self, silent: bool = False) -> None:
+        if self.realtime:
+            await self.realtime.cancel()
         if self.generation_task and not self.generation_task.done():
             self.generation_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -150,6 +178,25 @@ class GatewayConnection:
             if not silent:
                 await self.send("llm.done", cancelled=True)
         self.generation_task = None
+
+    async def send_provider_event(self, event_type: str, payload: Any) -> None:
+        data = payload if isinstance(payload, dict) else {}
+        await self.send(event_type, **data)
+        if event_type == "llm.done" or event_type == "response.audio.done":
+            await self.send_cost()
+
+    async def record_realtime_user_transcript(self, text: str) -> None:
+        self.session.latest_transcript = text
+        self.session.history.append({"role": "user", "content": text})
+        append_message(self.session.user_id, self.session.conversation_id, "user", text)
+        await self.send("asr.final", text=text)
+
+    async def record_realtime_assistant_transcript(self, text: str) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        self.session.history.append({"role": "assistant", "content": clean})
+        append_message(self.session.user_id, self.session.conversation_id, "assistant", clean)
 
     async def generate_response(self, user_text: str) -> None:
         answer_parts: list[str] = []

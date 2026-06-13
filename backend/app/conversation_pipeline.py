@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from importlib.util import find_spec
 from typing import Any
 
-from .ai import estimate_tokens, sentence_chunks, stream_llm
+from .ai import estimate_tokens, sentence_chunks, stream_direct_model
 from .models import SessionState
 
 
@@ -51,7 +51,7 @@ class ConversationPipeline:
         answer = ""
         tts_buffer = ""
 
-        async for delta in stream_llm(self.session, user_text):
+        async for delta in stream_direct_model(self.session, user_text):
             answer += delta
             tts_buffer += delta
             self.session.cost.llm_output_tokens_est += estimate_tokens(delta)
