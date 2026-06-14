@@ -47,6 +47,7 @@ import type { ChatMessage, CostSnapshot, GatewayEvent, VadSnapshot } from "./typ
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
 const SPEECH_AUTO_SEND_DELAY_MS = 1200;
 const DUPLICATE_SPEECH_WINDOW_MS = 1800;
+const BLUR_THRESHOLD = 80;
 const VOICE_STORAGE_KEY = "ai-vision-realtime-voice";
 const realtimeVoices = ["Cherry", "Serena", "Ethan", "Chelsie"] as const;
 type RealtimeVoice = (typeof realtimeVoices)[number];
@@ -446,22 +447,45 @@ export function App() {
     [clearPendingSpeech, client, finishAssistant, stopModelAudio, stopSpeech],
   );
 
-  const computeFrameDiff = useCallback(() => {
+  const computeFrameStats = useCallback(() => {
     const video = videoRef.current;
     const sample = sampleRef.current;
-    if (!video || !sample) return 100;
+    if (!video || !sample) return { diff: 100, sharpness: 1000 };
     const context = sample.getContext("2d", { willReadFrequently: true });
-    if (!context) return 100;
+    if (!context) return { diff: 100, sharpness: 1000 };
     sample.width = 64;
     sample.height = 36;
     context.drawImage(video, 0, 0, sample.width, sample.height);
     const data = context.getImageData(0, 0, sample.width, sample.height).data;
     const previous = lastSampleRef.current;
     lastSampleRef.current = new Uint8ClampedArray(data);
-    if (!previous) return 100;
     let diff = 0;
-    for (let i = 0; i < data.length; i += 16) diff += Math.abs(data[i] - previous[i]);
-    return diff / (data.length / 16);
+    if (previous) {
+      for (let i = 0; i < data.length; i += 16) diff += Math.abs(data[i] - previous[i]);
+      diff /= data.length / 16;
+    } else {
+      diff = 100;
+    }
+    let laplacian = 0;
+    let count = 0;
+    for (let y = 1; y < sample.height - 1; y += 1) {
+      for (let x = 1; x < sample.width - 1; x += 1) {
+        const index = (y * sample.width + x) * 4;
+        const center = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+        const leftIndex = (y * sample.width + x - 1) * 4;
+        const rightIndex = (y * sample.width + x + 1) * 4;
+        const upIndex = ((y - 1) * sample.width + x) * 4;
+        const downIndex = ((y + 1) * sample.width + x) * 4;
+        const left = data[leftIndex] * 0.299 + data[leftIndex + 1] * 0.587 + data[leftIndex + 2] * 0.114;
+        const right = data[rightIndex] * 0.299 + data[rightIndex + 1] * 0.587 + data[rightIndex + 2] * 0.114;
+        const up = data[upIndex] * 0.299 + data[upIndex + 1] * 0.587 + data[upIndex + 2] * 0.114;
+        const down = data[downIndex] * 0.299 + data[downIndex + 1] * 0.587 + data[downIndex + 2] * 0.114;
+        const value = 4 * center - left - right - up - down;
+        laplacian += value * value;
+        count += 1;
+      }
+    }
+    return { diff, sharpness: count ? laplacian / count : 1000 };
   }, []);
 
   const captureFrame = useCallback(
@@ -470,7 +494,8 @@ export function App() {
       const canvas = canvasRef.current;
       if (!video || !canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return false;
       const now = Date.now();
-      const diff = computeFrameDiff();
+      const { diff, sharpness } = computeFrameStats();
+      if (sharpness < BLUR_THRESHOLD && reason !== "manual") return false;
       const shouldSend = force || reason === "semantic" || now - lastVisionAtRef.current > 12000 || diff > 18;
       if (!shouldSend) return false;
 
@@ -486,7 +511,7 @@ export function App() {
       if (sent) lastVisionAtRef.current = now;
       return sent;
     },
-    [client, computeFrameDiff],
+    [client, computeFrameStats],
   );
 
   const sendFinalTranscript = useCallback(
