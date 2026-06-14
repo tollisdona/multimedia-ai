@@ -96,6 +96,33 @@ export async function createConversation(baseUrl: string, token: string, title =
   );
 }
 
+export async function fetchConversation(baseUrl: string, token: string, conversationId: string) {
+  return requestJson<PersistedConversation>(baseUrl, `/api/conversations/${conversationId}`, {}, token);
+}
+
+export async function renameConversation(baseUrl: string, token: string, conversationId: string, title: string) {
+  return requestJson<PersistedConversation>(
+    baseUrl,
+    `/api/conversations/${conversationId}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ title }),
+    },
+    token,
+  );
+}
+
+export async function deleteConversation(baseUrl: string, token: string, conversationId: string) {
+  await requestJson<unknown>(
+    baseUrl,
+    `/api/conversations/${conversationId}`,
+    {
+      method: "DELETE",
+    },
+    token,
+  );
+}
+
 export async function fetchConversationMessages(baseUrl: string, token: string, conversationId: string) {
   return requestJson<PersistedMessage[]>(baseUrl, `/api/conversations/${conversationId}/messages`, {}, token);
 }
