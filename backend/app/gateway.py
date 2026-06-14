@@ -86,6 +86,8 @@ class GatewayConnection:
                 await self.handle_final_transcript(text)
         elif message_type == "vision.frame":
             await self.handle_vision_frame(message)
+        elif message_type == "vision.clear":
+            await self.handle_vision_clear(message)
         elif message_type == "speech.cancel":
             await self.cancel_generation()
             self.session.cost.interruptions += 1
@@ -146,6 +148,14 @@ class GatewayConnection:
             bufferedFrames=len(self.session.recent_frames),
         )
         await self.send_cost()
+
+    async def handle_vision_clear(self, message: dict[str, Any]) -> None:
+        self.session.recent_frames.clear()
+        await self.send(
+            "vision.frames.cleared",
+            reason=str(message.get("reason", "camera_state_changed")),
+            bufferedFrames=0,
+        )
 
     async def handle_voice_update(self, message: dict[str, Any]) -> None:
         voice = str(message.get("voice", "")).strip()

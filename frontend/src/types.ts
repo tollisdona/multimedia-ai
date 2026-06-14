@@ -34,6 +34,7 @@ export type GatewayEvent =
   | { type: "asr.partial"; text: string }
   | { type: "asr.final"; text: string }
   | { type: "vision.frame.cached"; reason: string; frameHash: string; reused: boolean; bufferedFrames: number }
+  | { type: "vision.frames.cleared"; reason: string; bufferedFrames: number }
   | { type: "llm.delta"; delta: string }
   | { type: "llm.done"; cancelled: boolean }
   | { type: "response.text.delta"; delta: string }

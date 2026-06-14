@@ -862,12 +862,18 @@ export function App() {
         videoRef.current.srcObject = grantedStream;
         await videoRef.current.play();
       }
+      lastSampleRef.current = null;
+      lastVisionAtRef.current = 0;
 
       setConnectionState("connecting");
       client.connect();
       await client.waitOpen();
       client.send("session.start");
       client.send("session.voice.update", { voice: selectedVoice });
+      client.send("vision.clear", { reason: "session_started" });
+      window.setTimeout(() => {
+        void captureFrame("session-start", true);
+      }, 180);
 
       const audioCapture = new AudioCapture(client, setLevel, handleVad);
       await audioCapture.start(grantedStream);
@@ -886,6 +892,9 @@ export function App() {
         if (error.name === "NotReadableError") message = "摄像头或麦克风被其他应用占用，请关闭占用后重试。";
       }
       grantedStream?.getTracks().forEach((track) => track.stop());
+      lastSampleRef.current = null;
+      lastVisionAtRef.current = 0;
+      if (client.state === "open") client.send("vision.clear", { reason: "session_start_failed" });
       client.close();
       setSessionReady(false);
       setMediaReady(false);
@@ -896,7 +905,7 @@ export function App() {
     } finally {
       setMediaAction(null);
     }
-  }, [clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, mediaAction, mediaState, selectedVoice, startSpeechRecognition]);
+  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, mediaAction, mediaState, selectedVoice, startSpeechRecognition]);
   const stopSession = useCallback(async () => {
     if (mediaAction === "stop") return;
     setMediaAction("stop");
@@ -920,6 +929,9 @@ export function App() {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       audioCaptureRef.current = null;
+      lastSampleRef.current = null;
+      lastVisionAtRef.current = 0;
+      if (client.state === "open") client.send("vision.clear", { reason: "session_stopped" });
       client.close();
       if (assistantMessageIdRef.current) finishAssistant(true);
       setSessionReady(false);
