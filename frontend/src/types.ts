@@ -34,10 +34,9 @@ export interface VadSnapshot {
 export type GatewayEvent =
   | { type: "session.ready"; sessionId: string; capabilities: Record<string, unknown> }
   | { type: "session.started"; sessionId: string }
-  | { type: "asr.partial"; text: string }
-  | { type: "asr.final"; text: string }
+  | { type: "asr.partial"; text: string; source?: "browser" | "realtime" }
+  | { type: "asr.final"; text: string; source?: "browser" | "realtime" }
   | { type: "vision.frame.cached"; reason: string; frameHash: string; reused: boolean; bufferedFrames: number }
-  | { type: "vision.frames.cleared"; reason: string; bufferedFrames: number }
   | { type: "llm.delta"; delta: string }
   | { type: "llm.done"; cancelled: boolean }
   | { type: "response.text.delta"; delta: string }
