@@ -22,6 +22,7 @@ export class AudioCapture {
     private readonly onLevel: (rms: number) => void,
     private readonly onVad?: (snapshot: VadSnapshot) => void,
     private readonly onAudioChunkSent?: () => void,
+    private readonly shouldSendAudio?: () => boolean,
   ) {}
 
   async start(stream: MediaStream) {
@@ -44,16 +45,18 @@ export class AudioCapture {
         speechEnd: boolean;
       };
       this.onLevel(rms);
-      const sent = this.client.send("audio.input.chunk", {
-        seq: this.seq,
-        sampleRate,
-        durationMs,
-        rms,
-        encoding: "pcm16",
-        audio: int16ToBase64(pcm),
-      });
-      if (sent) this.onAudioChunkSent?.();
-      this.onVad?.({ rms, noiseFloor, isSpeech, speechStart, speechEnd });
+      if (this.shouldSendAudio?.() !== false) {
+        const sent = this.client.send("audio.input.chunk", {
+          seq: this.seq,
+          sampleRate,
+          durationMs,
+          rms,
+          encoding: "pcm16",
+          audio: int16ToBase64(pcm),
+        });
+        if (sent) this.onAudioChunkSent?.();
+        this.onVad?.({ rms, noiseFloor, isSpeech, speechStart, speechEnd });
+      }
       this.seq += 1;
     };
     this.source.connect(this.worklet);

@@ -3,18 +3,15 @@ from __future__ import annotations
 import asyncio
 import sys
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from importlib.util import find_spec
 from typing import Any
 
+from .agent_runtime import AgentContext, AgentRouter, AgentSpec, EmitEvent, PipelineEvent, RequestFrame
 from .ai import estimate_tokens, sentence_chunks, stream_direct_model
+from .medication_agent import MedicationInstructionAgent
+from .medication_intent import MEDICATION_AGENT, detect_medication_intent
+from .medication_ocr import QwenVlDocumentOcrProvider
 from .models import SessionState
-
-
-@dataclass(frozen=True)
-class PipelineEvent:
-    type: str
-    payload: dict[str, Any]
 
 
 def pipecat_runtime_status() -> dict[str, Any]:
@@ -44,10 +41,53 @@ class ConversationPipeline:
     the emitted events back over the existing WebSocket protocol.
     """
 
-    def __init__(self, session: SessionState) -> None:
+    def __init__(
+        self,
+        session: SessionState,
+        emit: EmitEvent | None = None,
+        request_frame: RequestFrame | None = None,
+        ocr_provider: Any | None = None,
+    ) -> None:
         self.session = session
+        self.emit = emit
+        self.request_frame = request_frame
+        self.ocr_provider = ocr_provider or QwenVlDocumentOcrProvider(session)
+        self.router = AgentRouter(
+            [
+                AgentSpec(
+                    name=MEDICATION_AGENT,
+                    runner_factory=lambda context: MedicationInstructionAgent(context),
+                )
+            ]
+        )
 
     async def run_user_turn(self, user_text: str) -> AsyncIterator[PipelineEvent]:
+        medication_context_active = self.session.agent_state == "medication.ready_for_followup"
+        medication_intent = detect_medication_intent(user_text, active_context=medication_context_active)
+        if medication_intent.should_exit:
+            self.clear_agent_state()
+            yield PipelineEvent("agent.exited", {"agent": MEDICATION_AGENT, "reason": "user_exit"})
+        elif medication_intent.matched:
+            spec = self.router.by_name(MEDICATION_AGENT)
+            if spec:
+                context = AgentContext(
+                    session=self.session,
+                    emit=self.emit,
+                    request_frame=self.request_frame,
+                    ocr_provider=self.ocr_provider,
+                )
+                runner = spec.runner_factory(context)
+                async for event in runner.run(user_text):
+                    yield event
+                return
+        elif medication_context_active:
+            self.clear_agent_state()
+            yield PipelineEvent("agent.exited", {"agent": MEDICATION_AGENT, "reason": "topic_changed"})
+
+        async for event in self.run_general_turn(user_text):
+            yield event
+
+    async def run_general_turn(self, user_text: str) -> AsyncIterator[PipelineEvent]:
         answer = ""
         tts_buffer = ""
 
@@ -72,6 +112,13 @@ class ConversationPipeline:
             self.session.history.append({"role": "assistant", "content": answer.strip()})
         yield PipelineEvent("llm.done", {"cancelled": False})
         yield PipelineEvent("session.cost", {"cost": self.session.cost.snapshot()})
+
+    def clear_agent_state(self) -> None:
+        self.session.active_agent = ""
+        self.session.agent_state = "idle"
+        self.session.agent_context = {}
+        self.session.agent_followup_until = 0
+        self.session.agent_turns_remaining = 0
 
     async def cancel_pending_work(self, task: asyncio.Task[None] | None) -> None:
         if task and not task.done():

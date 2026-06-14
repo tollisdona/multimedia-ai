@@ -18,6 +18,12 @@ from .models import SessionState
 
 Emit = Callable[[str, Any], Awaitable[None]]
 TranscriptHook = Callable[[str], Awaitable[None]]
+SUPPRESSED_REALTIME_ERROR_PATTERNS = (
+    "none active response",
+    "append image before append audio",
+    "input_image_buffer",
+    "response.cancel",
+)
 
 
 def realtime_available(model_config: RuntimeModelConfig | None = None) -> bool:
@@ -51,6 +57,7 @@ class QwenRealtimeProvider:
         self.assistant_buffer = ""
         self.assistant_saved = False
         self.connected = False
+        self.audio_append_seen = False
 
     async def connect(self) -> None:
         if self.websocket and self.connected:
@@ -58,11 +65,13 @@ class QwenRealtimeProvider:
         headers = {"Authorization": f"Bearer {self.model_config.api_key}"}
         self.websocket = await websockets.connect(realtime_url(self.model_config), extra_headers=headers, max_size=None)
         self.connected = True
+        self.audio_append_seen = False
         self.receive_task = asyncio.create_task(self.receive_loop())
         await self.update_session(self.voice)
 
     async def close(self) -> None:
         self.connected = False
+        self.audio_append_seen = False
         if self.receive_task:
             self.receive_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -105,9 +114,14 @@ class QwenRealtimeProvider:
                 "audio": audio_base64,
             }
         )
+        self.audio_append_seen = True
 
-    async def append_image(self, data_url: str) -> None:
+    async def append_image(self, data_url: str) -> bool:
+        if not self.audio_append_seen:
+            return False
         await self.ensure_connected()
+        if not self.audio_append_seen:
+            return False
         await self.send_raw(
             {
                 "event_id": self.event_id(),
@@ -115,6 +129,7 @@ class QwenRealtimeProvider:
                 "image": strip_data_url(data_url),
             }
         )
+        return True
 
     async def cancel(self) -> None:
         if not self.websocket or not self.connected:
@@ -150,17 +165,23 @@ class QwenRealtimeProvider:
             raise
         except Exception as exc:
             self.connected = False
+            self.audio_append_seen = False
             await self.emit("error", {"code": "realtime_disconnected", "message": str(exc)})
 
     async def handle_server_event(self, payload: dict[str, Any]) -> None:
         event_type = str(payload.get("type", ""))
         if event_type == "error":
             error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            code = str(error.get("code", "realtime_error"))
+            message = str(error.get("message", "Realtime provider error"))
+            message_lower = message.lower()
+            if code == "realtime_error" or any(pattern in message_lower for pattern in SUPPRESSED_REALTIME_ERROR_PATTERNS):
+                return
             await self.emit(
                 "error",
                 {
-                    "code": str(error.get("code", "realtime_error")),
-                    "message": str(error.get("message", "Realtime provider error")),
+                    "code": code,
+                    "message": message,
                 },
             )
             return

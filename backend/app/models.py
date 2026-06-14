@@ -105,3 +105,8 @@ class SessionState:
     history: list[dict[str, str]] = field(default_factory=list)
     cost: CostState = field(default_factory=CostState)
     cancelled_generation: bool = False
+    active_agent: str = ""
+    agent_state: str = "idle"
+    agent_context: dict[str, Any] = field(default_factory=dict)
+    agent_followup_until: int = 0
+    agent_turns_remaining: int = 0
