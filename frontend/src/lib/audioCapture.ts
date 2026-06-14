@@ -1,4 +1,5 @@
 import { GatewayClient } from "./wsClient";
+import type { VadSnapshot } from "../types";
 
 function int16ToBase64(input: Int16Array) {
   const bytes = new Uint8Array(input.buffer);
@@ -18,6 +19,7 @@ export class AudioCapture {
   constructor(
     private readonly client: GatewayClient,
     private readonly onLevel: (rms: number) => void,
+    private readonly onVad?: (snapshot: VadSnapshot) => void,
   ) {}
 
   async start(stream: MediaStream) {
@@ -26,11 +28,15 @@ export class AudioCapture {
     this.source = this.context.createMediaStreamSource(stream);
     this.worklet = new AudioWorkletNode(this.context, "pcm-capture");
     this.worklet.port.onmessage = (event) => {
-      const { pcm, rms, sampleRate, durationMs } = event.data as {
+      const { pcm, rms, sampleRate, durationMs, noiseFloor, isSpeech, speechStart, speechEnd } = event.data as {
         pcm: Int16Array;
         rms: number;
         sampleRate: number;
         durationMs: number;
+        noiseFloor: number;
+        isSpeech: boolean;
+        speechStart: boolean;
+        speechEnd: boolean;
       };
       this.onLevel(rms);
       this.client.send("audio.input.chunk", {
@@ -41,6 +47,7 @@ export class AudioCapture {
         encoding: "pcm16",
         audio: int16ToBase64(pcm),
       });
+      this.onVad?.({ rms, noiseFloor, isSpeech, speechStart, speechEnd });
       this.seq += 1;
     };
     this.source.connect(this.worklet);

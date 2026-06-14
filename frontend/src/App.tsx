@@ -43,12 +43,16 @@ import {
   type PersistedMessage,
 } from "./lib/api";
 import { GatewayClient } from "./lib/wsClient";
-import type { ChatMessage, CostSnapshot, GatewayEvent } from "./types";
+import type { ChatMessage, CostSnapshot, GatewayEvent, VadSnapshot } from "./types";
 
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
 const SPEECH_AUTO_SEND_DELAY_MS = 1200;
 const DUPLICATE_SPEECH_WINDOW_MS = 1800;
 const NEW_SESSION_BUSY_ID = "__new_session__";
+const BLUR_THRESHOLD = 80;
+const VOICE_STORAGE_KEY = "ai-vision-realtime-voice";
+const realtimeVoices = ["Cherry", "Serena", "Ethan", "Chelsie"] as const;
+type RealtimeVoice = (typeof realtimeVoices)[number];
 
 const emptyCost: CostSnapshot = {
   audioSeconds: 0,
@@ -91,6 +95,11 @@ function timeLabel(timestamp = Date.now()) {
 
 function createStarterMessages(): ChatMessage[] {
   return [{ id: uid(), role: "system", text: "混合流式助手已就绪：音频全流式、文本流式、视觉关键帧准实时。" }];
+}
+
+function loadStoredVoice(): RealtimeVoice {
+  const stored = localStorage.getItem(VOICE_STORAGE_KEY);
+  return realtimeVoices.includes(stored as RealtimeVoice) ? (stored as RealtimeVoice) : "Cherry";
 }
 
 function gatewayUrlWithToken(url: string, token?: string, conversationId?: string) {
@@ -156,9 +165,12 @@ export function App() {
   const lastSubmittedSpeechRef = useRef<{ text: string; at: number } | null>(null);
   const lastSampleRef = useRef<Uint8ClampedArray | null>(null);
   const lastVisionAtRef = useRef(0);
+  const speechFrameCountRef = useRef(0);
+  const lastSpeechFrameAtRef = useRef(0);
   const realtimeAudioRef = useRef(false);
   const modelAudioPlayingRef = useRef(false);
   const runningRef = useRef(false);
+  const aiStateRef = useRef<AiState>("idle");
 
   const [connectionState, setConnectionState] = useState("closed");
   const [sessionReady, setSessionReady] = useState(false);
@@ -180,6 +192,7 @@ export function App() {
   const [asrStatus, setAsrStatus] = useState("未启动");
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [aiState, setAiState] = useState<AiState>("idle");
+  const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(() => loadStoredVoice());
   const [realtimeAudio, setRealtimeAudio] = useState(false);
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [videoPanePercent, setVideoPanePercent] = useState(57.14);
@@ -215,6 +228,10 @@ export function App() {
       })),
     [sessionMessages, sessions],
   );
+
+  useEffect(() => {
+    aiStateRef.current = aiState;
+  }, [aiState]);
 
   useEffect(() => {
     setSessions((current) =>
@@ -441,22 +458,57 @@ export function App() {
     window.speechSynthesis?.cancel();
   }, []);
 
-  const computeFrameDiff = useCallback(() => {
+  const interruptActiveSpeech = useCallback(
+    (reason = "barge_in") => {
+      client.send("speech.cancel", { reason });
+      clearPendingSpeech();
+      stopModelAudio();
+      stopSpeech();
+      if (assistantMessageIdRef.current) finishAssistant(true);
+      setAiState(runningRef.current ? "listening" : "idle");
+    },
+    [clearPendingSpeech, client, finishAssistant, stopModelAudio, stopSpeech],
+  );
+
+  const computeFrameStats = useCallback(() => {
     const video = videoRef.current;
     const sample = sampleRef.current;
-    if (!video || !sample) return 100;
+    if (!video || !sample) return { diff: 100, sharpness: 1000 };
     const context = sample.getContext("2d", { willReadFrequently: true });
-    if (!context) return 100;
+    if (!context) return { diff: 100, sharpness: 1000 };
     sample.width = 64;
     sample.height = 36;
     context.drawImage(video, 0, 0, sample.width, sample.height);
     const data = context.getImageData(0, 0, sample.width, sample.height).data;
     const previous = lastSampleRef.current;
     lastSampleRef.current = new Uint8ClampedArray(data);
-    if (!previous) return 100;
     let diff = 0;
-    for (let i = 0; i < data.length; i += 16) diff += Math.abs(data[i] - previous[i]);
-    return diff / (data.length / 16);
+    if (previous) {
+      for (let i = 0; i < data.length; i += 16) diff += Math.abs(data[i] - previous[i]);
+      diff /= data.length / 16;
+    } else {
+      diff = 100;
+    }
+    let laplacian = 0;
+    let count = 0;
+    for (let y = 1; y < sample.height - 1; y += 1) {
+      for (let x = 1; x < sample.width - 1; x += 1) {
+        const index = (y * sample.width + x) * 4;
+        const center = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+        const leftIndex = (y * sample.width + x - 1) * 4;
+        const rightIndex = (y * sample.width + x + 1) * 4;
+        const upIndex = ((y - 1) * sample.width + x) * 4;
+        const downIndex = ((y + 1) * sample.width + x) * 4;
+        const left = data[leftIndex] * 0.299 + data[leftIndex + 1] * 0.587 + data[leftIndex + 2] * 0.114;
+        const right = data[rightIndex] * 0.299 + data[rightIndex + 1] * 0.587 + data[rightIndex + 2] * 0.114;
+        const up = data[upIndex] * 0.299 + data[upIndex + 1] * 0.587 + data[upIndex + 2] * 0.114;
+        const down = data[downIndex] * 0.299 + data[downIndex + 1] * 0.587 + data[downIndex + 2] * 0.114;
+        const value = 4 * center - left - right - up - down;
+        laplacian += value * value;
+        count += 1;
+      }
+    }
+    return { diff, sharpness: count ? laplacian / count : 1000 };
   }, []);
 
   const captureFrame = useCallback(
@@ -465,7 +517,8 @@ export function App() {
       const canvas = canvasRef.current;
       if (!video || !canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return false;
       const now = Date.now();
-      const diff = computeFrameDiff();
+      const { diff, sharpness } = computeFrameStats();
+      if (sharpness < BLUR_THRESHOLD && reason !== "manual") return false;
       const shouldSend = force || reason === "semantic" || now - lastVisionAtRef.current > 12000 || diff > 18;
       if (!shouldSend) return false;
 
@@ -481,7 +534,7 @@ export function App() {
       if (sent) lastVisionAtRef.current = now;
       return sent;
     },
-    [client, computeFrameDiff],
+    [client, computeFrameStats],
   );
 
   const sendFinalTranscript = useCallback(
@@ -603,6 +656,7 @@ export function App() {
         stopSpeech();
         finishAssistant(true);
       }
+      if (event.type === "voice.updated") setSelectedVoice(event.voice as RealtimeVoice);
       if (event.type === "session.cost") setCost(event.cost);
       if (event.type === "error") setLastError(`${event.code}: ${event.message}`);
     },
@@ -632,7 +686,6 @@ export function App() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      if (runningRef.current) void captureFrame("periodic");
       if (runningRef.current && client.state === "closed") {
         setSessionReady(false);
         client.connect();
@@ -743,7 +796,42 @@ export function App() {
     },
     [],
   );
+  
+  const handleVad = useCallback(
+    (snapshot: VadSnapshot) => {
+      if (!runningRef.current) return;
 
+      if (snapshot.speechStart) {
+        const assistantIsSpeaking =
+          modelAudioPlayingRef.current ||
+          aiStateRef.current === "speaking" ||
+          ttsPlayingRef.current ||
+          ttsQueueRef.current.length > 0;
+
+        if (assistantIsSpeaking) interruptActiveSpeech("barge_in");
+
+        speechFrameCountRef.current = 1;
+        lastSpeechFrameAtRef.current = Date.now();
+        void captureFrame("speech-start", true);
+      }
+
+      if (snapshot.isSpeech && speechFrameCountRef.current > 0 && speechFrameCountRef.current < 2) {
+        const now = Date.now();
+        if (now - lastSpeechFrameAtRef.current > 1200) {
+          speechFrameCountRef.current += 1;
+          lastSpeechFrameAtRef.current = now;
+          void captureFrame("speech-active", true);
+        }
+      }
+
+      if (snapshot.speechEnd) {
+        speechFrameCountRef.current = 0;
+        lastSpeechFrameAtRef.current = 0;
+      }
+    },
+    [captureFrame, interruptActiveSpeech],
+  );
+  
   const startSession = useCallback(async () => {
     let grantedStream: MediaStream | null = null;
     try {
@@ -775,8 +863,9 @@ export function App() {
       client.connect();
       await client.waitOpen();
       client.send("session.start");
+      client.send("session.voice.update", { voice: selectedVoice });
 
-      const audioCapture = new AudioCapture(client, setLevel);
+      const audioCapture = new AudioCapture(client, setLevel, handleVad);
       await audioCapture.start(grantedStream);
       audioCaptureRef.current = audioCapture;
       runningRef.current = true;
@@ -784,7 +873,6 @@ export function App() {
       setMediaState("running");
       if (realtimeAudioRef.current) setAsrStatus("Qwen Realtime ASR");
       else startSpeechRecognition();
-      await captureFrame("startup", true);
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       let message = raw;
@@ -802,8 +890,8 @@ export function App() {
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, startSpeechRecognition]);
-
+  }, [clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, selectedVoice, startSpeechRecognition]);
+  
   const stopSession = useCallback(async () => {
     runningRef.current = false;
     clearPendingSpeech();
@@ -1003,6 +1091,15 @@ export function App() {
     setAuthError("");
   }, [stopSession]);
 
+  const updateVoice = useCallback(
+    (voice: RealtimeVoice) => {
+      setSelectedVoice(voice);
+      localStorage.setItem(VOICE_STORAGE_KEY, voice);
+      if (client.state === "open") client.send("session.voice.update", { voice });
+    },
+    [client],
+  );
+
   if (!authSession) {
     return <AuthView apiBaseUrl={apiBaseUrl} error={authError} onAuthenticated={handleAuthenticated} />;
   }
@@ -1079,6 +1176,8 @@ export function App() {
                 gatewayUrl={gatewayUrl}
                 permissionStatus={permissionStatus}
                 asrStatus={asrStatus}
+                selectedVoice={selectedVoice}
+                setSelectedVoice={updateVoice}
                 user={authSession.user}
                 onLogout={logout}
               />
@@ -1763,12 +1862,16 @@ function SettingsView({
   gatewayUrl,
   permissionStatus,
   asrStatus,
+  selectedVoice,
+  setSelectedVoice,
   user,
   onLogout,
 }: {
   gatewayUrl: string;
   permissionStatus: string;
   asrStatus: string;
+  selectedVoice: RealtimeVoice;
+  setSelectedVoice: (voice: RealtimeVoice) => void;
   user: AuthSession["user"];
   onLogout: () => Promise<void>;
 }) {
@@ -1788,6 +1891,25 @@ function SettingsView({
         <ReadonlyField label="Gateway 地址" value={gatewayUrl} />
         <ReadonlyField label="权限状态" value={permissionStatus} />
         <ReadonlyField label="语音识别" value={asrStatus} />
+        <div className="rounded-2xl bg-slate-50 px-4 py-3">
+          <span className="text-xs font-black text-slate-400">Realtime 音色</span>
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {realtimeVoices.map((voice) => (
+              <button
+                key={voice}
+                className={cx(
+                  "h-10 rounded-2xl text-sm font-black transition",
+                  selectedVoice === voice ? "bg-slate-950 text-white" : "bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-100",
+                )}
+                onClick={() => setSelectedVoice(voice)}
+                type="button"
+              >
+                {voice}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-xs font-semibold text-slate-500">音色会保存到本机，并在会话启动或切换时同步给 Realtime Gateway。</p>
+        </div>
       </div>
     </section>
   );

@@ -20,6 +20,14 @@ export interface CostSnapshot {
   estimatedUnits: number;
 }
 
+export interface VadSnapshot {
+  rms: number;
+  noiseFloor: number;
+  isSpeech: boolean;
+  speechStart: boolean;
+  speechEnd: boolean;
+}
+
 export type GatewayEvent =
   | { type: "session.ready"; sessionId: string; capabilities: Record<string, unknown> }
   | { type: "session.started"; sessionId: string }
@@ -33,5 +41,6 @@ export type GatewayEvent =
   | { type: "response.audio.done" }
   | { type: "tts.audio.chunk"; mode: "browser-speech"; text: string }
   | { type: "speech.cancelled"; reason: string }
+  | { type: "voice.updated"; voice: string; provider: string }
   | { type: "session.cost"; cost: CostSnapshot }
   | { type: "error"; code: string; message: string };
