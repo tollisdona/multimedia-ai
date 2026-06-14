@@ -3,6 +3,7 @@ import {
   ArrowUp,
   BarChart3,
   Camera,
+  Check,
   CircleStop,
   Eye,
   History,
@@ -16,20 +17,25 @@ import {
   Settings,
   Shield,
   Square,
+  Pencil,
+  Trash2,
   Volume2,
   Wifi,
   WifiOff,
+  X,
 } from "lucide-react";
 import { AudioCapture } from "./lib/audioCapture";
 import { PcmStreamPlayer } from "./lib/pcmPlayer";
 import {
   createConversation,
+  deleteConversation,
   fetchConversationMessages,
   fetchConversations,
   fetchCurrentUser,
   loadStoredAuth,
   loginUser,
   registerUser,
+  renameConversation,
   storeAuth,
   type AuthSession,
   type PersistedConversation,
@@ -41,6 +47,9 @@ import type { ChatMessage, CostSnapshot, GatewayEvent, VadSnapshot } from "./typ
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
 const SPEECH_AUTO_SEND_DELAY_MS = 1200;
 const DUPLICATE_SPEECH_WINDOW_MS = 1800;
+const VOICE_STORAGE_KEY = "ai-vision-realtime-voice";
+const realtimeVoices = ["Cherry", "Serena", "Ethan", "Chelsie"] as const;
+type RealtimeVoice = (typeof realtimeVoices)[number];
 
 const emptyCost: CostSnapshot = {
   audioSeconds: 0,
@@ -83,6 +92,11 @@ function timeLabel(timestamp = Date.now()) {
 
 function createStarterMessages(): ChatMessage[] {
   return [{ id: uid(), role: "system", text: "混合流式助手已就绪：音频全流式、文本流式、视觉关键帧准实时。" }];
+}
+
+function loadStoredVoice(): RealtimeVoice {
+  const stored = localStorage.getItem(VOICE_STORAGE_KEY);
+  return realtimeVoices.includes(stored as RealtimeVoice) ? (stored as RealtimeVoice) : "Cherry";
 }
 
 function gatewayUrlWithToken(url: string, token?: string, conversationId?: string) {
@@ -173,10 +187,13 @@ export function App() {
   const [asrStatus, setAsrStatus] = useState("未启动");
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [aiState, setAiState] = useState<AiState>("idle");
+  const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(() => loadStoredVoice());
   const [realtimeAudio, setRealtimeAudio] = useState(false);
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [videoPanePercent, setVideoPanePercent] = useState(57.14);
   const [conversationsLoaded, setConversationsLoaded] = useState(false);
+  const [historyBusySessionId, setHistoryBusySessionId] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState("");
 
   const messages = sessionMessages[currentSessionId] ?? [];
   const setMessages = useCallback(
@@ -598,6 +615,7 @@ export function App() {
         stopSpeech();
         finishAssistant(true);
       }
+      if (event.type === "voice.updated") setSelectedVoice(event.voice as RealtimeVoice);
       if (event.type === "session.cost") setCost(event.cost);
       if (event.type === "error") setLastError(`${event.code}: ${event.message}`);
     },
@@ -759,6 +777,7 @@ export function App() {
       client.connect();
       await client.waitOpen();
       client.send("session.start");
+      client.send("session.voice.update", { voice: selectedVoice });
 
       const audioCapture = new AudioCapture(client, setLevel, handleVad);
       await audioCapture.start(grantedStream);
@@ -786,7 +805,8 @@ export function App() {
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, startSpeechRecognition]);
+  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, selectedVoice, handleVad, startSpeechRecognition]);
+
 
   const stopSession = useCallback(async () => {
     runningRef.current = false;
@@ -849,6 +869,7 @@ export function App() {
     if (!authSession?.accessToken) return;
     if (runningRef.current) await stopSession();
     if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+    setHistoryError("");
     const conversation = await createConversation(apiBaseUrl, authSession.accessToken, "新会话");
     setSessionMessages((store) => ({ ...store, [conversation.id]: createStarterMessages() }));
     setSessions((current) => [conversationToSession(conversation), ...current]);
@@ -864,6 +885,7 @@ export function App() {
       if (id === currentSessionId) return;
       if (runningRef.current) await stopSession();
       if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+      setHistoryError("");
       if (!sessionMessages[id]) await loadConversation(id);
       setCurrentSessionId(id);
       setPartial("");
@@ -871,6 +893,86 @@ export function App() {
       setActiveView("chat");
     },
     [cancel, currentSessionId, loadConversation, sessionMessages, stopSession],
+  );
+
+  const renameSession = useCallback(
+    async (id: string, title: string) => {
+      const clean = title.trim();
+      if (!authSession?.accessToken || !clean) return;
+      setHistoryBusySessionId(id);
+      setHistoryError("");
+      try {
+        const conversation = await renameConversation(apiBaseUrl, authSession.accessToken, id, clean);
+        setSessions((current) =>
+          current.map((session) =>
+            session.id === id
+              ? { ...session, title: conversation.title, updatedAt: timeLabel(conversation.updatedAt) }
+              : session,
+          ),
+        );
+      } catch (error) {
+        setHistoryError(error instanceof Error ? error.message : "重命名会话失败");
+        throw error;
+      } finally {
+        setHistoryBusySessionId(null);
+      }
+    },
+    [apiBaseUrl, authSession?.accessToken],
+  );
+
+  const deleteSession = useCallback(
+    async (id: string) => {
+      if (!authSession?.accessToken) return;
+      const deletingCurrent = id === currentSessionId;
+      const remaining = sessions.filter((session) => session.id !== id);
+      setHistoryBusySessionId(id);
+      setHistoryError("");
+      try {
+        if (deletingCurrent && runningRef.current) await stopSession();
+        if (deletingCurrent && (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0)) cancel();
+        await deleteConversation(apiBaseUrl, authSession.accessToken, id);
+        setSessions((current) => current.filter((session) => session.id !== id));
+        setSessionMessages((store) => {
+          const next = { ...store };
+          delete next[id];
+          return next;
+        });
+
+        if (!deletingCurrent) return;
+        const nextSession = remaining[0];
+        setPartial("");
+        setManualText("");
+        setCost(emptyCost);
+        if (nextSession) {
+          if (!sessionMessages[nextSession.id]) await loadConversation(nextSession.id);
+          setCurrentSessionId(nextSession.id);
+          setActiveView("chat");
+          return;
+        }
+
+        const conversation = await createConversation(apiBaseUrl, authSession.accessToken, "新会话");
+        setSessions([conversationToSession(conversation)]);
+        setSessionMessages((store) => ({ ...store, [conversation.id]: createStarterMessages() }));
+        setCurrentSessionId(conversation.id);
+        setActiveView("chat");
+      } catch (error) {
+        setHistoryError(error instanceof Error ? error.message : "删除会话失败");
+        throw error;
+      } finally {
+        setHistoryBusySessionId(null);
+      }
+    },
+    [
+      apiBaseUrl,
+      authSession?.accessToken,
+      cancel,
+      createConversation,
+      currentSessionId,
+      loadConversation,
+      sessionMessages,
+      sessions,
+      stopSession,
+    ],
   );
 
   const handleAuthenticated = useCallback((session: AuthSession) => {
@@ -885,6 +987,15 @@ export function App() {
     storeAuth(null);
     setAuthError("");
   }, [stopSession]);
+
+  const updateVoice = useCallback(
+    (voice: RealtimeVoice) => {
+      setSelectedVoice(voice);
+      localStorage.setItem(VOICE_STORAGE_KEY, voice);
+      if (client.state === "open") client.send("session.voice.update", { voice });
+    },
+    [client],
+  );
 
   if (!authSession) {
     return <AuthView apiBaseUrl={apiBaseUrl} error={authError} onAuthenticated={handleAuthenticated} />;
@@ -902,9 +1013,13 @@ export function App() {
       >
         <IconSidebar activeView={activeView} setActiveView={setActiveView} />
         <HistoryRail
+          busySessionId={historyBusySessionId}
           collapsed={historyCollapsed}
           currentSessionId={currentSessionId}
+          error={historyError}
+          onDeleteSession={deleteSession}
           onNewSession={startNewConversation}
+          onRenameSession={renameSession}
           onSelectSession={selectConversation}
           onToggle={() => setHistoryCollapsed((current) => !current)}
           sessions={historySessions}
@@ -958,6 +1073,8 @@ export function App() {
                 gatewayUrl={gatewayUrl}
                 permissionStatus={permissionStatus}
                 asrStatus={asrStatus}
+                selectedVoice={selectedVoice}
+                setSelectedVoice={updateVoice}
                 user={authSession.user}
                 onLogout={logout}
               />
@@ -1084,16 +1201,24 @@ function IconSidebar({ activeView, setActiveView }: { activeView: AppView; setAc
 }
 
 function HistoryRail({
+  busySessionId,
   collapsed,
   currentSessionId,
+  error,
+  onDeleteSession,
   onNewSession,
+  onRenameSession,
   onSelectSession,
   onToggle,
   sessions,
 }: {
+  busySessionId: string | null;
   collapsed: boolean;
   currentSessionId: string;
+  error: string;
+  onDeleteSession: (id: string) => Promise<void>;
   onNewSession: () => Promise<void>;
+  onRenameSession: (id: string, title: string) => Promise<void>;
   onSelectSession: (id: string) => Promise<void>;
   onToggle: () => void;
   sessions: SessionListItem[];
@@ -1132,30 +1257,154 @@ function HistoryRail({
       <div className="mb-3 flex items-center gap-2 text-xs font-black uppercase tracking-wide text-slate-500">
         <History size={15} /> 历史记录
       </div>
+      {error && <p className="mb-3 rounded-2xl bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700">{error}</p>}
       <div className="space-y-2">
         {sessions.length === 0 ? (
           <p className="rounded-2xl border border-dashed border-slate-300 p-4 text-sm text-slate-500">暂无会话历史</p>
         ) : (
           sessions.map((session) => (
-            <button
+            <HistorySessionItem
               key={session.id}
-              className={cx(
-                "w-full rounded-2xl px-3 py-3 text-left transition",
-                session.id === currentSessionId ? "bg-white text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white",
-              )}
-              onClick={() => void onSelectSession(session.id)}
-            >
-              <span className="flex items-center gap-2 text-sm font-black">
-                <MessageSquare size={15} /> {session.title}
-              </span>
-              <span className="mt-1 block text-xs font-semibold text-slate-400">
-                {session.updatedAt} · {session.messageCount} 条消息
-              </span>
-            </button>
+              active={session.id === currentSessionId}
+              busy={busySessionId === session.id}
+              onDeleteSession={onDeleteSession}
+              onRenameSession={onRenameSession}
+              onSelectSession={onSelectSession}
+              session={session}
+            />
           ))
         )}
       </div>
     </aside>
+  );
+}
+
+function HistorySessionItem({
+  active,
+  busy,
+  onDeleteSession,
+  onRenameSession,
+  onSelectSession,
+  session,
+}: {
+  active: boolean;
+  busy: boolean;
+  onDeleteSession: (id: string) => Promise<void>;
+  onRenameSession: (id: string, title: string) => Promise<void>;
+  onSelectSession: (id: string) => Promise<void>;
+  session: SessionListItem;
+}) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [draftTitle, setDraftTitle] = useState(session.title);
+
+  useEffect(() => {
+    if (!isEditing) setDraftTitle(session.title);
+  }, [isEditing, session.title]);
+
+  const submitRename = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const clean = draftTitle.trim();
+    if (!clean || clean === session.title) {
+      setIsEditing(false);
+      setDraftTitle(session.title);
+      return;
+    }
+    try {
+      await onRenameSession(session.id, clean);
+      setIsEditing(false);
+    } catch {
+      // Error is rendered by the history rail.
+    }
+  };
+
+  const deleteCurrentSession = async () => {
+    if (!window.confirm(`删除会话「${session.title}」？`)) return;
+    try {
+      await onDeleteSession(session.id);
+    } catch {
+      // Error is rendered by the history rail.
+    }
+  };
+
+  return (
+    <article
+      className={cx(
+        "rounded-2xl px-3 py-3 transition",
+        active ? "bg-white text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white",
+      )}
+    >
+      {isEditing ? (
+        <form className="grid gap-2" onSubmit={submitRename}>
+          <input
+            autoFocus
+            className="h-9 rounded-xl border border-slate-200 bg-white px-3 text-sm font-bold text-slate-900 outline-none focus:border-cyan-400"
+            disabled={busy}
+            maxLength={80}
+            onChange={(event) => setDraftTitle(event.target.value)}
+            value={draftTitle}
+          />
+          <div className="flex justify-end gap-1">
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl text-slate-500 hover:bg-slate-100 disabled:opacity-50"
+              disabled={busy}
+              onClick={() => {
+                setIsEditing(false);
+                setDraftTitle(session.title);
+              }}
+              title="取消重命名"
+              type="button"
+            >
+              <X size={16} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl bg-slate-950 text-white disabled:opacity-50"
+              disabled={busy || !draftTitle.trim()}
+              title="保存会话名称"
+              type="submit"
+            >
+              <Check size={16} />
+            </button>
+          </div>
+        </form>
+      ) : (
+        <div className="flex items-start gap-2">
+          <button
+            className="min-w-0 flex-1 text-left"
+            disabled={busy}
+            onClick={() => void onSelectSession(session.id)}
+            type="button"
+          >
+            <span className="flex min-w-0 items-center gap-2 text-sm font-black">
+              <MessageSquare className="shrink-0" size={15} />
+              <span className="truncate">{session.title}</span>
+            </span>
+            <span className="mt-1 block text-xs font-semibold text-slate-400">
+              {session.updatedAt} · {session.messageCount} 条消息
+            </span>
+          </button>
+          <div className="flex shrink-0 gap-1">
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50"
+              disabled={busy}
+              onClick={() => setIsEditing(true)}
+              title="重命名会话"
+              type="button"
+            >
+              <Pencil size={15} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl text-slate-400 hover:bg-rose-50 hover:text-rose-700 disabled:opacity-50"
+              disabled={busy}
+              onClick={() => void deleteCurrentSession()}
+              title="删除会话"
+              type="button"
+            >
+              <Trash2 size={15} />
+            </button>
+          </div>
+        </div>
+      )}
+    </article>
   );
 }
 
@@ -1502,12 +1751,16 @@ function SettingsView({
   gatewayUrl,
   permissionStatus,
   asrStatus,
+  selectedVoice,
+  setSelectedVoice,
   user,
   onLogout,
 }: {
   gatewayUrl: string;
   permissionStatus: string;
   asrStatus: string;
+  selectedVoice: RealtimeVoice;
+  setSelectedVoice: (voice: RealtimeVoice) => void;
   user: AuthSession["user"];
   onLogout: () => Promise<void>;
 }) {
@@ -1527,6 +1780,25 @@ function SettingsView({
         <ReadonlyField label="Gateway 地址" value={gatewayUrl} />
         <ReadonlyField label="权限状态" value={permissionStatus} />
         <ReadonlyField label="语音识别" value={asrStatus} />
+        <div className="rounded-2xl bg-slate-50 px-4 py-3">
+          <span className="text-xs font-black text-slate-400">Realtime 音色</span>
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {realtimeVoices.map((voice) => (
+              <button
+                key={voice}
+                className={cx(
+                  "h-10 rounded-2xl text-sm font-black transition",
+                  selectedVoice === voice ? "bg-slate-950 text-white" : "bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-100",
+                )}
+                onClick={() => setSelectedVoice(voice)}
+                type="button"
+              >
+                {voice}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-xs font-semibold text-slate-500">音色会保存到本机，并在会话启动或切换时同步给 Realtime Gateway。</p>
+        </div>
       </div>
     </section>
   );
