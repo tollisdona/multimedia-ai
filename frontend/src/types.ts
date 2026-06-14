@@ -20,6 +20,14 @@ export interface CostSnapshot {
   estimatedUnits: number;
 }
 
+export interface VadSnapshot {
+  rms: number;
+  noiseFloor: number;
+  isSpeech: boolean;
+  speechStart: boolean;
+  speechEnd: boolean;
+}
+
 export type GatewayEvent =
   | { type: "session.ready"; sessionId: string; capabilities: Record<string, unknown> }
   | { type: "session.started"; sessionId: string }
