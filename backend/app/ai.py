@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from .config import settings
+from .model_config import env_model_config
 from .models import SessionState
 
 
@@ -69,20 +70,14 @@ def build_direct_messages(session: SessionState, user_text: str) -> list[dict[st
     ]
 
 
-def direct_model_config() -> tuple[str, str, str, bool] | None:
-    if settings.omni_api_key:
+def direct_model_config(session: SessionState) -> tuple[str, str, str, bool] | None:
+    configured = session.model_config or env_model_config()
+    if configured and configured.api_key:
         return (
-            settings.omni_api_key,
-            settings.omni_base_url,
-            settings.resolved_omni_chat_model,
-            True,
-        )
-    if settings.vision_api_key:
-        return (
-            settings.vision_api_key,
-            settings.vision_base_url,
-            settings.vision_model,
-            False,
+            configured.api_key,
+            configured.base_url,
+            configured.chat_model,
+            configured.supports_modalities,
         )
     return None
 
@@ -95,7 +90,7 @@ async def stream_direct_model(session: SessionState, user_text: str) -> AsyncIte
     )
     session.cost.llm_input_tokens_est += estimate_tokens(text_for_estimate)
 
-    model_config = direct_model_config()
+    model_config = direct_model_config(session)
     if model_config is None:
         text = (
             "我收到了你的问题。"

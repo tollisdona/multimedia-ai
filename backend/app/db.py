@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import sqlite3
 import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from cryptography.fernet import Fernet, InvalidToken
 
 from .config import settings
 from .models import now_ms
@@ -74,6 +78,22 @@ def init_db() -> None:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS user_model_configs (
+                user_id TEXT PRIMARY KEY,
+                api_key_ciphertext TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL,
+                chat_model TEXT NOT NULL,
+                realtime_enabled INTEGER NOT NULL DEFAULT 0,
+                realtime_base_url TEXT NOT NULL,
+                realtime_model TEXT NOT NULL,
+                realtime_voice TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_conversations_user_updated
             ON conversations(user_id, updated_at DESC)
             """
@@ -90,6 +110,27 @@ def init_db() -> None:
             ON cost_snapshots(conversation_id, user_id, created_at DESC)
             """
         )
+
+
+def api_key_cipher() -> Fernet:
+    digest = hashlib.sha256(settings.jwt_secret_key.encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def encrypt_api_key(api_key: str) -> str:
+    clean = api_key.strip()
+    if not clean:
+        return ""
+    return api_key_cipher().encrypt(clean.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_api_key(ciphertext: str) -> str:
+    if not ciphertext:
+        return ""
+    try:
+        return api_key_cipher().decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+    except InvalidToken:
+        return ""
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -130,6 +171,91 @@ def get_user_by_id(user_id: str) -> dict[str, Any] | None:
             (user_id,),
         ).fetchone()
     return row_to_dict(row)
+
+
+def default_saved_model_values() -> dict[str, Any]:
+    return {
+        "base_url": settings.omni_base_url,
+        "chat_model": settings.resolved_omni_chat_model,
+        "realtime_enabled": settings.omni_realtime_enabled,
+        "realtime_base_url": settings.omni_realtime_base_url,
+        "realtime_model": settings.omni_realtime_model,
+        "realtime_voice": settings.omni_realtime_voice,
+    }
+
+
+def get_saved_model_config(user_id: str) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT user_id, api_key_ciphertext, base_url, chat_model, realtime_enabled,
+                   realtime_base_url, realtime_model, realtime_voice, updated_at
+            FROM user_model_configs
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+    config = row_to_dict(row)
+    if not config:
+        return None
+    config["api_key"] = decrypt_api_key(str(config.pop("api_key_ciphertext", "")))
+    config["realtime_enabled"] = bool(config["realtime_enabled"])
+    return config
+
+
+def save_model_config(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    current = get_saved_model_config(user_id)
+    defaults = default_saved_model_values()
+    previous_api_key = str(current.get("api_key", "")) if current else ""
+    next_api_key = previous_api_key
+    if payload.get("clearApiKey"):
+        next_api_key = ""
+    elif payload.get("apiKey"):
+        next_api_key = str(payload["apiKey"]).strip()
+
+    values = {
+        "base_url": str(payload.get("baseUrl") or defaults["base_url"]).rstrip("/"),
+        "chat_model": str(payload.get("chatModel") or defaults["chat_model"]),
+        "realtime_enabled": 1 if payload.get("realtimeEnabled") else 0,
+        "realtime_base_url": str(payload.get("realtimeBaseUrl") or defaults["realtime_base_url"]).rstrip("/"),
+        "realtime_model": str(payload.get("realtimeModel") or defaults["realtime_model"]),
+        "realtime_voice": str(payload.get("realtimeVoice") or defaults["realtime_voice"]),
+        "api_key_ciphertext": encrypt_api_key(next_api_key),
+        "updated_at": now_ms(),
+    }
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO user_model_configs
+                (user_id, api_key_ciphertext, base_url, chat_model, realtime_enabled,
+                 realtime_base_url, realtime_model, realtime_voice, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                api_key_ciphertext = excluded.api_key_ciphertext,
+                base_url = excluded.base_url,
+                chat_model = excluded.chat_model,
+                realtime_enabled = excluded.realtime_enabled,
+                realtime_base_url = excluded.realtime_base_url,
+                realtime_model = excluded.realtime_model,
+                realtime_voice = excluded.realtime_voice,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user_id,
+                values["api_key_ciphertext"],
+                values["base_url"],
+                values["chat_model"],
+                values["realtime_enabled"],
+                values["realtime_base_url"],
+                values["realtime_model"],
+                values["realtime_voice"],
+                values["updated_at"],
+            ),
+        )
+    saved = get_saved_model_config(user_id)
+    if not saved:
+        raise RuntimeError("failed to save model config")
+    return saved
 
 
 def normalize_username(username: str) -> str:

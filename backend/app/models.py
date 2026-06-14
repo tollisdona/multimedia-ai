@@ -60,6 +60,7 @@ class SessionState:
     session_id: str = field(default_factory=lambda: str(uuid4()))
     user_id: str = ""
     conversation_id: str = ""
+    model_config: Any | None = None
     created_at: int = field(default_factory=now_ms)
     latest_transcript: str = ""
     recent_frames: list[FrameSnapshot] = field(default_factory=list)

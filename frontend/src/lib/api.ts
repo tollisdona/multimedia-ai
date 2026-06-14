@@ -26,6 +26,30 @@ export interface PersistedMessage {
   createdAt: number;
 }
 
+export interface ModelConfig {
+  baseUrl: string;
+  chatModel: string;
+  realtimeEnabled: boolean;
+  realtimeBaseUrl: string;
+  realtimeModel: string;
+  realtimeVoice: string;
+  keyConfigured: boolean;
+  keyPreview: string;
+  keySource: "user" | "environment" | "missing";
+  updatedAt: number | null;
+}
+
+export interface ModelConfigUpdate {
+  apiKey?: string;
+  clearApiKey?: boolean;
+  baseUrl: string;
+  chatModel: string;
+  realtimeEnabled: boolean;
+  realtimeBaseUrl: string;
+  realtimeModel: string;
+  realtimeVoice: string;
+}
+
 const AUTH_STORAGE_KEY = "ai-vision-auth";
 
 async function requestJson<T>(baseUrl: string, path: string, options: RequestInit = {}, token?: string) {
@@ -125,4 +149,20 @@ export async function deleteConversation(baseUrl: string, token: string, convers
 
 export async function fetchConversationMessages(baseUrl: string, token: string, conversationId: string) {
   return requestJson<PersistedMessage[]>(baseUrl, `/api/conversations/${conversationId}/messages`, {}, token);
+}
+
+export async function fetchModelConfig(baseUrl: string, token: string) {
+  return requestJson<ModelConfig>(baseUrl, "/api/model-config", {}, token);
+}
+
+export async function updateModelConfig(baseUrl: string, token: string, payload: ModelConfigUpdate) {
+  return requestJson<ModelConfig>(
+    baseUrl,
+    "/api/model-config",
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    token,
+  );
 }
