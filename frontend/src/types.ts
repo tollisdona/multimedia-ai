@@ -36,7 +36,11 @@ export type GatewayEvent =
   | { type: "vision.frame.cached"; reason: string; frameHash: string; reused: boolean; bufferedFrames: number }
   | { type: "llm.delta"; delta: string }
   | { type: "llm.done"; cancelled: boolean }
+  | { type: "response.text.delta"; delta: string }
+  | { type: "response.audio.delta"; audio: string; encoding: "pcm16"; sampleRate: number }
+  | { type: "response.audio.done" }
   | { type: "tts.audio.chunk"; mode: "browser-speech"; text: string }
   | { type: "speech.cancelled"; reason: string }
+  | { type: "voice.updated"; voice: string; provider: string }
   | { type: "session.cost"; cost: CostSnapshot }
   | { type: "error"; code: string; message: string };

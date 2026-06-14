@@ -3,6 +3,7 @@ import {
   ArrowUp,
   BarChart3,
   Camera,
+  Check,
   CircleStop,
   Eye,
   History,
@@ -16,19 +17,25 @@ import {
   Settings,
   Shield,
   Square,
+  Pencil,
+  Trash2,
   Volume2,
   Wifi,
   WifiOff,
+  X,
 } from "lucide-react";
 import { AudioCapture } from "./lib/audioCapture";
+import { PcmStreamPlayer } from "./lib/pcmPlayer";
 import {
   createConversation,
+  deleteConversation,
   fetchConversationMessages,
   fetchConversations,
   fetchCurrentUser,
   loadStoredAuth,
   loginUser,
   registerUser,
+  renameConversation,
   storeAuth,
   type AuthSession,
   type PersistedConversation,
@@ -40,6 +47,9 @@ import type { ChatMessage, CostSnapshot, GatewayEvent, VadSnapshot } from "./typ
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
 const SPEECH_AUTO_SEND_DELAY_MS = 1200;
 const DUPLICATE_SPEECH_WINDOW_MS = 1800;
+const VOICE_STORAGE_KEY = "ai-vision-realtime-voice";
+const realtimeVoices = ["Cherry", "Serena", "Ethan", "Chelsie"] as const;
+type RealtimeVoice = (typeof realtimeVoices)[number];
 
 const emptyCost: CostSnapshot = {
   audioSeconds: 0,
@@ -82,6 +92,11 @@ function timeLabel(timestamp = Date.now()) {
 
 function createStarterMessages(): ChatMessage[] {
   return [{ id: uid(), role: "system", text: "混合流式助手已就绪：音频全流式、文本流式、视觉关键帧准实时。" }];
+}
+
+function loadStoredVoice(): RealtimeVoice {
+  const stored = localStorage.getItem(VOICE_STORAGE_KEY);
+  return realtimeVoices.includes(stored as RealtimeVoice) ? (stored as RealtimeVoice) : "Cherry";
 }
 
 function gatewayUrlWithToken(url: string, token?: string, conversationId?: string) {
@@ -129,6 +144,7 @@ export function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sampleRef = useRef<HTMLCanvasElement | null>(null);
   const audioCaptureRef = useRef<AudioCapture | null>(null);
+  const audioPlayerRef = useRef<PcmStreamPlayer | null>(null);
   const recognitionRef = useRef<any>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const assistantMessageIdRef = useRef<string | null>(null);
@@ -148,7 +164,10 @@ export function App() {
   const lastVisionAtRef = useRef(0);
   const speechFrameCountRef = useRef(0);
   const lastSpeechFrameAtRef = useRef(0);
+  const realtimeAudioRef = useRef(false);
+  const modelAudioPlayingRef = useRef(false);
   const runningRef = useRef(false);
+  const aiStateRef = useRef<AiState>("idle");
 
   const [connectionState, setConnectionState] = useState("closed");
   const [sessionReady, setSessionReady] = useState(false);
@@ -170,9 +189,13 @@ export function App() {
   const [asrStatus, setAsrStatus] = useState("未启动");
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [aiState, setAiState] = useState<AiState>("idle");
+  const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(() => loadStoredVoice());
+  const [realtimeAudio, setRealtimeAudio] = useState(false);
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [videoPanePercent, setVideoPanePercent] = useState(57.14);
   const [conversationsLoaded, setConversationsLoaded] = useState(false);
+  const [historyBusySessionId, setHistoryBusySessionId] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState("");
 
   const messages = sessionMessages[currentSessionId] ?? [];
   const setMessages = useCallback(
@@ -202,6 +225,10 @@ export function App() {
       })),
     [sessionMessages, sessions],
   );
+
+  useEffect(() => {
+    aiStateRef.current = aiState;
+  }, [aiState]);
 
   useEffect(() => {
     setSessions((current) =>
@@ -322,7 +349,7 @@ export function App() {
     assistantPlaceholderRef.current = false;
     assistantTextRef.current = "";
     assistantTextFromTtsRef.current = false;
-    if (!ttsPlayingRef.current && ttsQueueRef.current.length === 0) {
+    if (!ttsPlayingRef.current && ttsQueueRef.current.length === 0 && !modelAudioPlayingRef.current) {
       setAiState(runningRef.current ? "listening" : "idle");
     }
   }, [setMessages]);
@@ -331,6 +358,27 @@ export function App() {
     pendingSpeechRef.current = "";
     window.clearTimeout(pendingSpeechTimerRef.current);
     setPartial("");
+  }, []);
+
+  const stopModelAudio = useCallback(() => {
+    audioPlayerRef.current?.stop();
+    modelAudioPlayingRef.current = false;
+  }, []);
+
+  const ensureAudioPlayer = useCallback(() => {
+    if (!audioPlayerRef.current) {
+      audioPlayerRef.current = new PcmStreamPlayer(
+        () => {
+          modelAudioPlayingRef.current = true;
+          setAiState("speaking");
+        },
+        () => {
+          modelAudioPlayingRef.current = false;
+          if (!assistantMessageIdRef.current) setAiState(runningRef.current ? "listening" : "idle");
+        },
+      );
+    }
+    return audioPlayerRef.current;
   }, []);
 
   const processTtsQueue = useCallback(() => {
@@ -385,6 +433,18 @@ export function App() {
     setAiState(runningRef.current ? "listening" : "idle");
     window.speechSynthesis?.cancel();
   }, []);
+
+  const interruptActiveSpeech = useCallback(
+    (reason = "barge_in") => {
+      client.send("speech.cancel", { reason });
+      clearPendingSpeech();
+      stopModelAudio();
+      stopSpeech();
+      if (assistantMessageIdRef.current) finishAssistant(true);
+      setAiState(runningRef.current ? "listening" : "idle");
+    },
+    [clearPendingSpeech, client, finishAssistant, stopModelAudio, stopSpeech],
+  );
 
   const computeFrameDiff = useCallback(() => {
     const video = videoRef.current;
@@ -488,6 +548,18 @@ export function App() {
       if (event.type === "session.ready") {
         setConnectionState("open");
         setSessionReady(true);
+        const enabled = event.capabilities.realtime === true;
+        realtimeAudioRef.current = enabled;
+        setRealtimeAudio(enabled);
+        if (enabled) {
+          setAsrStatus("Qwen Realtime ASR");
+          try {
+            recognitionRef.current?.stop?.();
+          } catch {
+            // Ignore duplicate stop.
+          }
+          recognitionRef.current = null;
+        }
       }
       if (event.type === "asr.partial") {
         setPartial(event.text);
@@ -509,22 +581,34 @@ export function App() {
         setAiState((current) => (current === "speaking" ? current : "processing"));
         updateAssistantDelta(event.delta);
       }
+      if (event.type === "response.text.delta") {
+        setAiState((current) => (current === "speaking" ? current : "processing"));
+        updateAssistantDelta(event.delta);
+      }
+      if (event.type === "response.audio.delta") {
+        void ensureAudioPlayer().play(event.audio, event.sampleRate);
+      }
+      if (event.type === "response.audio.done") {
+        if (!modelAudioPlayingRef.current && !assistantMessageIdRef.current) setAiState(runningRef.current ? "listening" : "idle");
+      }
       if (event.type === "tts.audio.chunk") {
         if (!assistantMessageIdRef.current) beginAssistantResponse();
         if (event.text?.trim() && (assistantTextFromTtsRef.current || !assistantTextRef.current.trim())) {
           updateAssistantDelta(event.text, "tts");
         }
-        enqueueSpeech(event.text);
+        if (!realtimeAudioRef.current) enqueueSpeech(event.text);
       }
       if (event.type === "llm.done") finishAssistant(event.cancelled);
       if (event.type === "speech.cancelled") {
+        stopModelAudio();
         stopSpeech();
         finishAssistant(true);
       }
+      if (event.type === "voice.updated") setSelectedVoice(event.voice as RealtimeVoice);
       if (event.type === "session.cost") setCost(event.cost);
       if (event.type === "error") setLastError(`${event.code}: ${event.message}`);
     },
-    [appendMessage, beginAssistantResponse, currentSessionId, enqueueSpeech, finishAssistant, stopSpeech, updateAssistantDelta],
+    [appendMessage, beginAssistantResponse, currentSessionId, enqueueSpeech, ensureAudioPlayer, finishAssistant, stopModelAudio, stopSpeech, updateAssistantDelta],
   );
 
   useEffect(() => client.on(handleGatewayEvent), [client, handleGatewayEvent]);
@@ -571,6 +655,10 @@ export function App() {
   }, [checkMediaPermissions]);
 
   const startSpeechRecognition = useCallback(() => {
+    if (realtimeAudioRef.current) {
+      setAsrStatus("Qwen Realtime ASR");
+      return;
+    }
     if (recognitionRef.current || recognitionDisabledRef.current || recognitionPausedForTtsRef.current) return;
     const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
     if (!Recognition) {
@@ -645,15 +733,25 @@ export function App() {
     },
     [],
   );
-
+  
   const handleVad = useCallback(
     (snapshot: VadSnapshot) => {
       if (!runningRef.current) return;
+
       if (snapshot.speechStart) {
+        const assistantIsSpeaking =
+          modelAudioPlayingRef.current ||
+          aiStateRef.current === "speaking" ||
+          ttsPlayingRef.current ||
+          ttsQueueRef.current.length > 0;
+
+        if (assistantIsSpeaking) interruptActiveSpeech("barge_in");
+
         speechFrameCountRef.current = 1;
         lastSpeechFrameAtRef.current = Date.now();
         void captureFrame("speech-start", true);
       }
+
       if (snapshot.isSpeech && speechFrameCountRef.current > 0 && speechFrameCountRef.current < 2) {
         const now = Date.now();
         if (now - lastSpeechFrameAtRef.current > 1200) {
@@ -662,14 +760,15 @@ export function App() {
           void captureFrame("speech-active", true);
         }
       }
+
       if (snapshot.speechEnd) {
         speechFrameCountRef.current = 0;
         lastSpeechFrameAtRef.current = 0;
       }
     },
-    [captureFrame],
+    [captureFrame, interruptActiveSpeech],
   );
-
+  
   const startSession = useCallback(async () => {
     let grantedStream: MediaStream | null = null;
     try {
@@ -701,6 +800,7 @@ export function App() {
       client.connect();
       await client.waitOpen();
       client.send("session.start");
+      client.send("session.voice.update", { voice: selectedVoice });
 
       const audioCapture = new AudioCapture(client, setLevel, handleVad);
       await audioCapture.start(grantedStream);
@@ -708,7 +808,8 @@ export function App() {
       runningRef.current = true;
       setAiState("listening");
       setMediaState("running");
-      startSpeechRecognition();
+      if (realtimeAudioRef.current) setAsrStatus("Qwen Realtime ASR");
+      else startSpeechRecognition();
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       let message = raw;
@@ -726,11 +827,12 @@ export function App() {
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, startSpeechRecognition]);
-
+  }, [clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, selectedVoice, startSpeechRecognition]);
+  
   const stopSession = useCallback(async () => {
     runningRef.current = false;
     clearPendingSpeech();
+    stopModelAudio();
     ttsQueueRef.current = [];
     ttsPlayingRef.current = false;
     window.speechSynthesis?.cancel();
@@ -755,7 +857,7 @@ export function App() {
     setConnectionState("closed");
     setAsrStatus("已停止");
     setAiState("idle");
-  }, [clearPendingSpeech, client, finishAssistant]);
+  }, [clearPendingSpeech, client, finishAssistant, stopModelAudio]);
 
   const sendManual = useCallback(async () => {
     const text = manualText.trim();
@@ -768,12 +870,13 @@ export function App() {
   const cancel = useCallback(() => {
     client.send("speech.cancel", { reason: "manual" });
     clearPendingSpeech();
+    stopModelAudio();
     ttsQueueRef.current = [];
     ttsPlayingRef.current = false;
     window.speechSynthesis?.cancel();
     finishAssistant(true);
     setAiState(runningRef.current ? "listening" : "idle");
-  }, [clearPendingSpeech, client, finishAssistant]);
+  }, [clearPendingSpeech, client, finishAssistant, stopModelAudio]);
 
   const handleComposerAction = useCallback(() => {
     if (isProcessing) {
@@ -787,6 +890,7 @@ export function App() {
     if (!authSession?.accessToken) return;
     if (runningRef.current) await stopSession();
     if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+    setHistoryError("");
     const conversation = await createConversation(apiBaseUrl, authSession.accessToken, "新会话");
     setSessionMessages((store) => ({ ...store, [conversation.id]: createStarterMessages() }));
     setSessions((current) => [conversationToSession(conversation), ...current]);
@@ -802,6 +906,7 @@ export function App() {
       if (id === currentSessionId) return;
       if (runningRef.current) await stopSession();
       if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+      setHistoryError("");
       if (!sessionMessages[id]) await loadConversation(id);
       setCurrentSessionId(id);
       setPartial("");
@@ -809,6 +914,86 @@ export function App() {
       setActiveView("chat");
     },
     [cancel, currentSessionId, loadConversation, sessionMessages, stopSession],
+  );
+
+  const renameSession = useCallback(
+    async (id: string, title: string) => {
+      const clean = title.trim();
+      if (!authSession?.accessToken || !clean) return;
+      setHistoryBusySessionId(id);
+      setHistoryError("");
+      try {
+        const conversation = await renameConversation(apiBaseUrl, authSession.accessToken, id, clean);
+        setSessions((current) =>
+          current.map((session) =>
+            session.id === id
+              ? { ...session, title: conversation.title, updatedAt: timeLabel(conversation.updatedAt) }
+              : session,
+          ),
+        );
+      } catch (error) {
+        setHistoryError(error instanceof Error ? error.message : "重命名会话失败");
+        throw error;
+      } finally {
+        setHistoryBusySessionId(null);
+      }
+    },
+    [apiBaseUrl, authSession?.accessToken],
+  );
+
+  const deleteSession = useCallback(
+    async (id: string) => {
+      if (!authSession?.accessToken) return;
+      const deletingCurrent = id === currentSessionId;
+      const remaining = sessions.filter((session) => session.id !== id);
+      setHistoryBusySessionId(id);
+      setHistoryError("");
+      try {
+        if (deletingCurrent && runningRef.current) await stopSession();
+        if (deletingCurrent && (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0)) cancel();
+        await deleteConversation(apiBaseUrl, authSession.accessToken, id);
+        setSessions((current) => current.filter((session) => session.id !== id));
+        setSessionMessages((store) => {
+          const next = { ...store };
+          delete next[id];
+          return next;
+        });
+
+        if (!deletingCurrent) return;
+        const nextSession = remaining[0];
+        setPartial("");
+        setManualText("");
+        setCost(emptyCost);
+        if (nextSession) {
+          if (!sessionMessages[nextSession.id]) await loadConversation(nextSession.id);
+          setCurrentSessionId(nextSession.id);
+          setActiveView("chat");
+          return;
+        }
+
+        const conversation = await createConversation(apiBaseUrl, authSession.accessToken, "新会话");
+        setSessions([conversationToSession(conversation)]);
+        setSessionMessages((store) => ({ ...store, [conversation.id]: createStarterMessages() }));
+        setCurrentSessionId(conversation.id);
+        setActiveView("chat");
+      } catch (error) {
+        setHistoryError(error instanceof Error ? error.message : "删除会话失败");
+        throw error;
+      } finally {
+        setHistoryBusySessionId(null);
+      }
+    },
+    [
+      apiBaseUrl,
+      authSession?.accessToken,
+      cancel,
+      createConversation,
+      currentSessionId,
+      loadConversation,
+      sessionMessages,
+      sessions,
+      stopSession,
+    ],
   );
 
   const handleAuthenticated = useCallback((session: AuthSession) => {
@@ -823,6 +1008,15 @@ export function App() {
     storeAuth(null);
     setAuthError("");
   }, [stopSession]);
+
+  const updateVoice = useCallback(
+    (voice: RealtimeVoice) => {
+      setSelectedVoice(voice);
+      localStorage.setItem(VOICE_STORAGE_KEY, voice);
+      if (client.state === "open") client.send("session.voice.update", { voice });
+    },
+    [client],
+  );
 
   if (!authSession) {
     return <AuthView apiBaseUrl={apiBaseUrl} error={authError} onAuthenticated={handleAuthenticated} />;
@@ -840,9 +1034,13 @@ export function App() {
       >
         <IconSidebar activeView={activeView} setActiveView={setActiveView} />
         <HistoryRail
+          busySessionId={historyBusySessionId}
           collapsed={historyCollapsed}
           currentSessionId={currentSessionId}
+          error={historyError}
+          onDeleteSession={deleteSession}
           onNewSession={startNewConversation}
+          onRenameSession={renameSession}
           onSelectSession={selectConversation}
           onToggle={() => setHistoryCollapsed((current) => !current)}
           sessions={historySessions}
@@ -889,13 +1087,15 @@ export function App() {
               />
             )}
             {activeView === "cost" && (
-              <CostStation cost={cost} connectionState={connectionState} permissionStatus={permissionStatus} asrStatus={asrStatus} />
+              <CostStation cost={cost} connectionState={connectionState} permissionStatus={permissionStatus} asrStatus={asrStatus} realtimeAudio={realtimeAudio} />
             )}
             {activeView === "settings" && (
               <SettingsView
                 gatewayUrl={gatewayUrl}
                 permissionStatus={permissionStatus}
                 asrStatus={asrStatus}
+                selectedVoice={selectedVoice}
+                setSelectedVoice={updateVoice}
                 user={authSession.user}
                 onLogout={logout}
               />
@@ -1022,16 +1222,24 @@ function IconSidebar({ activeView, setActiveView }: { activeView: AppView; setAc
 }
 
 function HistoryRail({
+  busySessionId,
   collapsed,
   currentSessionId,
+  error,
+  onDeleteSession,
   onNewSession,
+  onRenameSession,
   onSelectSession,
   onToggle,
   sessions,
 }: {
+  busySessionId: string | null;
   collapsed: boolean;
   currentSessionId: string;
+  error: string;
+  onDeleteSession: (id: string) => Promise<void>;
   onNewSession: () => Promise<void>;
+  onRenameSession: (id: string, title: string) => Promise<void>;
   onSelectSession: (id: string) => Promise<void>;
   onToggle: () => void;
   sessions: SessionListItem[];
@@ -1070,30 +1278,154 @@ function HistoryRail({
       <div className="mb-3 flex items-center gap-2 text-xs font-black uppercase tracking-wide text-slate-500">
         <History size={15} /> 历史记录
       </div>
+      {error && <p className="mb-3 rounded-2xl bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700">{error}</p>}
       <div className="space-y-2">
         {sessions.length === 0 ? (
           <p className="rounded-2xl border border-dashed border-slate-300 p-4 text-sm text-slate-500">暂无会话历史</p>
         ) : (
           sessions.map((session) => (
-            <button
+            <HistorySessionItem
               key={session.id}
-              className={cx(
-                "w-full rounded-2xl px-3 py-3 text-left transition",
-                session.id === currentSessionId ? "bg-white text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white",
-              )}
-              onClick={() => void onSelectSession(session.id)}
-            >
-              <span className="flex items-center gap-2 text-sm font-black">
-                <MessageSquare size={15} /> {session.title}
-              </span>
-              <span className="mt-1 block text-xs font-semibold text-slate-400">
-                {session.updatedAt} · {session.messageCount} 条消息
-              </span>
-            </button>
+              active={session.id === currentSessionId}
+              busy={busySessionId === session.id}
+              onDeleteSession={onDeleteSession}
+              onRenameSession={onRenameSession}
+              onSelectSession={onSelectSession}
+              session={session}
+            />
           ))
         )}
       </div>
     </aside>
+  );
+}
+
+function HistorySessionItem({
+  active,
+  busy,
+  onDeleteSession,
+  onRenameSession,
+  onSelectSession,
+  session,
+}: {
+  active: boolean;
+  busy: boolean;
+  onDeleteSession: (id: string) => Promise<void>;
+  onRenameSession: (id: string, title: string) => Promise<void>;
+  onSelectSession: (id: string) => Promise<void>;
+  session: SessionListItem;
+}) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [draftTitle, setDraftTitle] = useState(session.title);
+
+  useEffect(() => {
+    if (!isEditing) setDraftTitle(session.title);
+  }, [isEditing, session.title]);
+
+  const submitRename = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const clean = draftTitle.trim();
+    if (!clean || clean === session.title) {
+      setIsEditing(false);
+      setDraftTitle(session.title);
+      return;
+    }
+    try {
+      await onRenameSession(session.id, clean);
+      setIsEditing(false);
+    } catch {
+      // Error is rendered by the history rail.
+    }
+  };
+
+  const deleteCurrentSession = async () => {
+    if (!window.confirm(`删除会话「${session.title}」？`)) return;
+    try {
+      await onDeleteSession(session.id);
+    } catch {
+      // Error is rendered by the history rail.
+    }
+  };
+
+  return (
+    <article
+      className={cx(
+        "rounded-2xl px-3 py-3 transition",
+        active ? "bg-white text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white",
+      )}
+    >
+      {isEditing ? (
+        <form className="grid gap-2" onSubmit={submitRename}>
+          <input
+            autoFocus
+            className="h-9 rounded-xl border border-slate-200 bg-white px-3 text-sm font-bold text-slate-900 outline-none focus:border-cyan-400"
+            disabled={busy}
+            maxLength={80}
+            onChange={(event) => setDraftTitle(event.target.value)}
+            value={draftTitle}
+          />
+          <div className="flex justify-end gap-1">
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl text-slate-500 hover:bg-slate-100 disabled:opacity-50"
+              disabled={busy}
+              onClick={() => {
+                setIsEditing(false);
+                setDraftTitle(session.title);
+              }}
+              title="取消重命名"
+              type="button"
+            >
+              <X size={16} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl bg-slate-950 text-white disabled:opacity-50"
+              disabled={busy || !draftTitle.trim()}
+              title="保存会话名称"
+              type="submit"
+            >
+              <Check size={16} />
+            </button>
+          </div>
+        </form>
+      ) : (
+        <div className="flex items-start gap-2">
+          <button
+            className="min-w-0 flex-1 text-left"
+            disabled={busy}
+            onClick={() => void onSelectSession(session.id)}
+            type="button"
+          >
+            <span className="flex min-w-0 items-center gap-2 text-sm font-black">
+              <MessageSquare className="shrink-0" size={15} />
+              <span className="truncate">{session.title}</span>
+            </span>
+            <span className="mt-1 block text-xs font-semibold text-slate-400">
+              {session.updatedAt} · {session.messageCount} 条消息
+            </span>
+          </button>
+          <div className="flex shrink-0 gap-1">
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50"
+              disabled={busy}
+              onClick={() => setIsEditing(true)}
+              title="重命名会话"
+              type="button"
+            >
+              <Pencil size={15} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl text-slate-400 hover:bg-rose-50 hover:text-rose-700 disabled:opacity-50"
+              disabled={busy}
+              onClick={() => void deleteCurrentSession()}
+              title="删除会话"
+              type="button"
+            >
+              <Trash2 size={15} />
+            </button>
+          </div>
+        </div>
+      )}
+    </article>
   );
 }
 
@@ -1401,7 +1733,7 @@ function AiStatusIndicator({ state }: { state: AiState }) {
   );
 }
 
-function CostStation({ cost, connectionState, permissionStatus, asrStatus }: { cost: CostSnapshot; connectionState: string; permissionStatus: string; asrStatus: string }) {
+function CostStation({ cost, connectionState, permissionStatus, asrStatus, realtimeAudio }: { cost: CostSnapshot; connectionState: string; permissionStatus: string; asrStatus: string; realtimeAudio: boolean }) {
   return (
     <section className="space-y-6">
       <div className="rounded-[2rem] bg-slate-950 p-8 text-white shadow-soft">
@@ -1430,7 +1762,7 @@ function CostStation({ cost, connectionState, permissionStatus, asrStatus }: { c
         <PipelineItem icon={<Camera size={16} />} label={`权限：${permissionStatus}`} />
         <PipelineItem icon={<Mic size={16} />} label={`ASR：${asrStatus}`} />
         <PipelineItem icon={<Eye size={16} />} label="Direct Omni/VL" />
-        <PipelineItem icon={<Volume2 size={16} />} label="Browser TTS" />
+        <PipelineItem icon={<Volume2 size={16} />} label={realtimeAudio ? "Qwen Realtime Audio" : "Browser TTS"} />
       </div>
     </section>
   );
@@ -1440,12 +1772,16 @@ function SettingsView({
   gatewayUrl,
   permissionStatus,
   asrStatus,
+  selectedVoice,
+  setSelectedVoice,
   user,
   onLogout,
 }: {
   gatewayUrl: string;
   permissionStatus: string;
   asrStatus: string;
+  selectedVoice: RealtimeVoice;
+  setSelectedVoice: (voice: RealtimeVoice) => void;
   user: AuthSession["user"];
   onLogout: () => Promise<void>;
 }) {
@@ -1465,6 +1801,25 @@ function SettingsView({
         <ReadonlyField label="Gateway 地址" value={gatewayUrl} />
         <ReadonlyField label="权限状态" value={permissionStatus} />
         <ReadonlyField label="语音识别" value={asrStatus} />
+        <div className="rounded-2xl bg-slate-50 px-4 py-3">
+          <span className="text-xs font-black text-slate-400">Realtime 音色</span>
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {realtimeVoices.map((voice) => (
+              <button
+                key={voice}
+                className={cx(
+                  "h-10 rounded-2xl text-sm font-black transition",
+                  selectedVoice === voice ? "bg-slate-950 text-white" : "bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-100",
+                )}
+                onClick={() => setSelectedVoice(voice)}
+                type="button"
+              >
+                {voice}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-xs font-semibold text-slate-500">音色会保存到本机，并在会话启动或切换时同步给 Realtime Gateway。</p>
+        </div>
       </div>
     </section>
   );
