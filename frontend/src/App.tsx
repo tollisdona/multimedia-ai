@@ -57,6 +57,7 @@ const emptyCost: CostSnapshot = {
 
 type AppView = "chat" | "cost" | "settings";
 type AiState = "idle" | "listening" | "processing" | "speaking";
+type MediaAction = "start" | "stop" | null;
 type SessionMeta = {
   id: string;
   title: string;
@@ -156,6 +157,7 @@ export function App() {
   const [sessionReady, setSessionReady] = useState(false);
   const [mediaReady, setMediaReady] = useState(false);
   const [mediaState, setMediaState] = useState("idle");
+  const [mediaAction, setMediaAction] = useState<MediaAction>(null);
   const [level, setLevel] = useState(0);
   const [partial, setPartial] = useState("");
   const [sessions, setSessions] = useState<SessionMeta[]>([
@@ -699,6 +701,8 @@ export function App() {
   );
 
   const startSession = useCallback(async () => {
+    if (mediaAction || mediaState === "running") return;
+    setMediaAction("start");
     let grantedStream: MediaStream | null = null;
     try {
       if (!conversationsLoaded || !currentSessionId) {
@@ -755,38 +759,46 @@ export function App() {
       setLastError(message);
       setMediaState("error");
       setConnectionState(client.state);
+    } finally {
+      setMediaAction(null);
     }
-  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, startSpeechRecognition]);
+  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, mediaAction, mediaState, startSpeechRecognition]);
 
   const stopSession = useCallback(async () => {
-    runningRef.current = false;
-    clearPendingSpeech();
-    stopModelAudio();
-    ttsQueueRef.current = [];
-    ttsPlayingRef.current = false;
-    window.speechSynthesis?.cancel();
-    window.clearTimeout(recognitionRestartTimerRef.current);
-    recognitionDisabledRef.current = false;
-    recognitionPausedForTtsRef.current = false;
+    if (mediaAction === "stop") return;
+    setMediaAction("stop");
     try {
-      recognitionRef.current?.stop?.();
-    } catch {
-      // Some browsers throw if recognition has already stopped.
+      runningRef.current = false;
+      clearPendingSpeech();
+      stopModelAudio();
+      ttsQueueRef.current = [];
+      ttsPlayingRef.current = false;
+      window.speechSynthesis?.cancel();
+      window.clearTimeout(recognitionRestartTimerRef.current);
+      recognitionDisabledRef.current = false;
+      recognitionPausedForTtsRef.current = false;
+      try {
+        recognitionRef.current?.stop?.();
+      } catch {
+        // Some browsers throw if recognition is already stopped.
+      }
+      recognitionRef.current = null;
+      await audioCaptureRef.current?.stop();
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+      audioCaptureRef.current = null;
+      client.close();
+      if (assistantMessageIdRef.current) finishAssistant(true);
+      setSessionReady(false);
+      setMediaReady(false);
+      setMediaState("stopped");
+      setConnectionState("closed");
+      setAsrStatus("已停止");
+      setAiState("idle");
+    } finally {
+      setMediaAction(null);
     }
-    recognitionRef.current = null;
-    await audioCaptureRef.current?.stop();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    audioCaptureRef.current = null;
-    client.close();
-    if (assistantMessageIdRef.current) finishAssistant(true);
-    setSessionReady(false);
-    setMediaReady(false);
-    setMediaState("stopped");
-    setConnectionState("closed");
-    setAsrStatus("已停止");
-    setAiState("idle");
-  }, [clearPendingSpeech, client, finishAssistant, stopModelAudio]);
+  }, [clearPendingSpeech, client, finishAssistant, mediaAction, stopModelAudio]);
 
   const sendManual = useCallback(async () => {
     const text = manualText.trim();
@@ -814,6 +826,11 @@ export function App() {
     }
     if (canSend) void sendManual();
   }, [cancel, canSend, isProcessing, sendManual]);
+
+  const toggleVoiceSession = useCallback(async () => {
+    if (mediaState === "running") await stopSession();
+    else await startSession();
+  }, [mediaState, startSession, stopSession]);
 
   const startNewConversation = useCallback(async () => {
     if (!authSession?.accessToken) return;
@@ -885,6 +902,7 @@ export function App() {
             activeView={activeView}
             connectionState={connectionState}
             gatewayReady={gatewayReady}
+            mediaAction={mediaAction}
             mediaState={mediaState}
             startSession={startSession}
             stopSession={stopSession}
@@ -892,7 +910,7 @@ export function App() {
 
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6 pb-4 max-lg:px-4">
             {permissionNeedsAction && (
-              <PermissionBanner permissionStatus={permissionStatus} startSession={startSession} />
+              <PermissionBanner mediaAction={mediaAction} permissionStatus={permissionStatus} startSession={startSession} />
             )}
             {lastError && (
               <div className="mb-4 flex items-center gap-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-800">
@@ -909,10 +927,14 @@ export function App() {
                 isProcessing={isProcessing}
                 level={level}
                 manualText={manualText}
+                mediaAction={mediaAction}
+                mediaState={mediaState}
                 messages={messages}
+                onNewSession={startNewConversation}
                 partial={partial}
                 setManualText={setManualText}
                 sendManual={sendManual}
+                toggleVoiceSession={toggleVoiceSession}
                 videoRef={videoRef}
                 canvasRef={canvasRef}
                 sampleRef={sampleRef}
@@ -1133,6 +1155,7 @@ function TopBar({
   activeView,
   connectionState,
   gatewayReady,
+  mediaAction,
   mediaState,
   startSession,
   stopSession,
@@ -1140,11 +1163,14 @@ function TopBar({
   activeView: AppView;
   connectionState: string;
   gatewayReady: boolean;
+  mediaAction: MediaAction;
   mediaState: string;
   startSession: () => Promise<void>;
   stopSession: () => Promise<void>;
 }) {
   const gatewayLabel = gatewayReady ? "Gateway 已就绪" : connectionState === "open" ? "Gateway 待授权" : "Gateway 未连接";
+  const isStarting = mediaAction === "start";
+  const isStopping = mediaAction === "stop";
   return (
     <header className="flex min-h-16 items-center justify-between gap-4 border-b border-slate-200 px-7 py-3 max-md:flex-col max-md:items-start max-md:px-4">
       <div>
@@ -1156,12 +1182,22 @@ function TopBar({
       <div className="flex items-center gap-3">
         <StatusPill label={gatewayLabel} active={gatewayReady} />
         {mediaState !== "running" ? (
-          <button className="inline-flex h-10 items-center gap-2 rounded-2xl bg-emerald-700 px-5 text-sm font-bold text-white hover:bg-emerald-800" onClick={() => void startSession()}>
-            <Play size={18} /> 启动会话
+          <button
+            className="inline-flex h-10 items-center gap-2 rounded-2xl bg-emerald-700 px-5 text-sm font-bold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={mediaAction !== null}
+            onClick={() => void startSession()}
+            type="button"
+          >
+            <Play size={18} /> {isStarting ? "启动中..." : "启动会话"}
           </button>
         ) : (
-          <button className="inline-flex h-10 items-center gap-2 rounded-2xl bg-rose-600 px-5 text-sm font-bold text-white hover:bg-rose-700" onClick={() => void stopSession()}>
-            <CircleStop size={18} /> 停止
+          <button
+            className="inline-flex h-10 items-center gap-2 rounded-2xl bg-rose-600 px-5 text-sm font-bold text-white hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={mediaAction !== null}
+            onClick={() => void stopSession()}
+            type="button"
+          >
+            <CircleStop size={18} /> {isStopping ? "停止中..." : "停止"}
           </button>
         )}
       </div>
@@ -1169,7 +1205,15 @@ function TopBar({
   );
 }
 
-function PermissionBanner({ permissionStatus, startSession }: { permissionStatus: string; startSession: () => Promise<void> }) {
+function PermissionBanner({
+  mediaAction,
+  permissionStatus,
+  startSession,
+}: {
+  mediaAction: MediaAction;
+  permissionStatus: string;
+  startSession: () => Promise<void>;
+}) {
   return (
     <div className="mb-4 flex items-center justify-between gap-4 rounded-3xl border border-amber-200 bg-amber-50 px-5 py-4 text-amber-950 shadow-sm max-md:flex-col max-md:items-start">
       <div className="flex items-center gap-3">
@@ -1181,8 +1225,13 @@ function PermissionBanner({ permissionStatus, startSession }: { permissionStatus
           <span className="text-sm text-amber-800">{permissionStatus}。点击请求后浏览器会弹出权限提示。</span>
         </div>
       </div>
-      <button className="rounded-2xl bg-amber-900 px-4 py-2 text-sm font-bold text-white" onClick={() => void startSession()}>
-        请求权限
+      <button
+        className="rounded-2xl bg-amber-900 px-4 py-2 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-60"
+        disabled={mediaAction !== null}
+        onClick={() => void startSession()}
+        type="button"
+      >
+        {mediaAction === "start" ? "请求中..." : "请求权限"}
       </button>
     </div>
   );
@@ -1196,10 +1245,14 @@ function ChatView(props: {
   isProcessing: boolean;
   level: number;
   manualText: string;
+  mediaAction: MediaAction;
+  mediaState: string;
   messages: ChatMessage[];
+  onNewSession: () => Promise<void>;
   partial: string;
   setManualText: (text: string) => void;
   sendManual: () => Promise<void>;
+  toggleVoiceSession: () => Promise<void>;
   videoRef: React.RefObject<HTMLVideoElement | null>;
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   sampleRef: React.RefObject<HTMLCanvasElement | null>;
@@ -1214,10 +1267,14 @@ function ChatView(props: {
     isProcessing,
     level,
     manualText,
+    mediaAction,
+    mediaState,
     messages,
+    onNewSession,
     partial,
     setManualText,
     sendManual,
+    toggleVoiceSession,
     videoRef,
     canvasRef,
     sampleRef,
@@ -1305,8 +1362,12 @@ function ChatView(props: {
           isProcessing={isProcessing}
           level={level}
           manualText={manualText}
+          mediaAction={mediaAction}
+          mediaState={mediaState}
+          onNewSession={onNewSession}
           sendManual={sendManual}
           setManualText={setManualText}
+          toggleVoiceSession={toggleVoiceSession}
         />
       </div>
     </section>
@@ -1342,17 +1403,26 @@ function Composer({
   isProcessing,
   level,
   manualText,
+  mediaAction,
+  mediaState,
+  onNewSession,
   sendManual,
   setManualText,
+  toggleVoiceSession,
 }: {
   canSend: boolean;
   handleComposerAction: () => void;
   isProcessing: boolean;
   level: number;
   manualText: string;
+  mediaAction: MediaAction;
+  mediaState: string;
+  onNewSession: () => Promise<void>;
   sendManual: () => Promise<void>;
   setManualText: (text: string) => void;
+  toggleVoiceSession: () => Promise<void>;
 }) {
+  const voiceButtonTitle = mediaState === "running" ? "停止语音会话" : "启动语音会话";
   return (
     <div className="border-t border-slate-200 p-4">
       <div className="rounded-[2rem] border border-slate-200 bg-white p-3 shadow-soft">
@@ -1370,9 +1440,27 @@ function Composer({
           rows={2}
         />
         <div className="flex items-center gap-3 px-2 pb-1">
-          <button className="grid h-10 w-10 place-items-center rounded-full text-slate-500 hover:bg-slate-100"><Plus size={22} /></button>
+          <button
+            className="grid h-10 w-10 place-items-center rounded-full text-slate-500 hover:bg-slate-100"
+            onClick={() => void onNewSession()}
+            title="新会话"
+            type="button"
+          >
+            <Plus size={22} />
+          </button>
           <div className="ml-auto flex items-center gap-3">
-            <button className="grid h-10 w-10 place-items-center rounded-full text-slate-500 hover:bg-slate-100"><Mic size={21} /></button>
+            <button
+              className={cx(
+                "grid h-10 w-10 place-items-center rounded-full text-slate-500 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60",
+                mediaState === "running" && "bg-emerald-50 text-emerald-700 hover:bg-emerald-100",
+              )}
+              disabled={mediaAction !== null}
+              onClick={() => void toggleVoiceSession()}
+              title={voiceButtonTitle}
+              type="button"
+            >
+              <Mic size={21} />
+            </button>
             <button
               className={cx(
                 "grid h-12 w-12 place-items-center rounded-full transition",
@@ -1383,6 +1471,7 @@ function Composer({
               disabled={!isProcessing && !canSend}
               onClick={handleComposerAction}
               title={isProcessing ? "中断回复" : "发送"}
+              type="button"
             >
               {isProcessing ? <Square size={18} /> : <ArrowUp size={23} />}
             </button>
