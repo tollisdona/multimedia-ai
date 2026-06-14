@@ -11,7 +11,7 @@ import websockets
 from websockets.client import WebSocketClientProtocol
 
 from .ai import direct_model_system_prompt, estimate_tokens, strip_data_url
-from .config import settings
+from .model_config import RuntimeModelConfig, env_model_config
 from .models import SessionState
 
 
@@ -19,13 +19,14 @@ Emit = Callable[[str, Any], Awaitable[None]]
 TranscriptHook = Callable[[str], Awaitable[None]]
 
 
-def realtime_available() -> bool:
-    return settings.omni_realtime_enabled and bool(settings.omni_api_key)
+def realtime_available(model_config: RuntimeModelConfig | None = None) -> bool:
+    configured = model_config or env_model_config()
+    return bool(configured and configured.realtime_enabled and configured.api_key)
 
 
-def realtime_url() -> str:
-    separator = "&" if "?" in settings.omni_realtime_base_url else "?"
-    return f"{settings.omni_realtime_base_url}{separator}model={settings.omni_realtime_model}"
+def realtime_url(model_config: RuntimeModelConfig) -> str:
+    separator = "&" if "?" in model_config.realtime_base_url else "?"
+    return f"{model_config.realtime_base_url}{separator}model={model_config.realtime_model}"
 
 
 class QwenRealtimeProvider:
@@ -35,12 +36,14 @@ class QwenRealtimeProvider:
         emit: Emit,
         on_user_transcript: TranscriptHook,
         on_assistant_transcript: TranscriptHook,
+        model_config: RuntimeModelConfig,
     ) -> None:
         self.session = session
         self.emit = emit
         self.on_user_transcript = on_user_transcript
         self.on_assistant_transcript = on_assistant_transcript
-        self.voice = settings.omni_realtime_voice
+        self.model_config = model_config
+        self.voice = model_config.realtime_voice
         self.websocket: WebSocketClientProtocol | None = None
         self.receive_task: asyncio.Task[None] | None = None
         self.send_lock = asyncio.Lock()
@@ -51,8 +54,8 @@ class QwenRealtimeProvider:
     async def connect(self) -> None:
         if self.websocket and self.connected:
             return
-        headers = {"Authorization": f"Bearer {settings.omni_api_key}"}
-        self.websocket = await websockets.connect(realtime_url(), extra_headers=headers, max_size=None)
+        headers = {"Authorization": f"Bearer {self.model_config.api_key}"}
+        self.websocket = await websockets.connect(realtime_url(self.model_config), extra_headers=headers, max_size=None)
         self.connected = True
         self.receive_task = asyncio.create_task(self.receive_loop())
         await self.update_session(self.voice)
@@ -86,7 +89,7 @@ class QwenRealtimeProvider:
                     "turn_detection": {
                         "type": "server_vad",
                         "threshold": 0.35,
-                        "silence_duration_ms": 700,
+                        "silence_duration_ms": self.model_config.realtime_vad_silence_ms,
                     },
                 },
             }

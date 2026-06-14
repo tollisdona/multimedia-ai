@@ -5,6 +5,7 @@ from .auth import authenticate_token, me_router, router as auth_router
 from .conversations import router as conversations_router
 from .db import create_conversation, get_conversation, init_db
 from .gateway import GatewayConnection
+from .model_config import router as model_config_router
 
 
 app = FastAPI(title="AI Vision Conversation Gateway")
@@ -21,6 +22,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(me_router)
 app.include_router(conversations_router)
+app.include_router(model_config_router)
 
 
 @app.on_event("startup")

@@ -10,6 +10,7 @@ from starlette.websockets import WebSocketDisconnect
 from .ai import frame_hash
 from .conversation_pipeline import ConversationPipeline, pipecat_runtime_status
 from .db import append_message, save_cost_snapshot
+from .model_config import runtime_model_config_for_user
 from .models import FrameSnapshot, SessionState, event, now_ms
 from .realtime import QwenRealtimeProvider, realtime_available
 
@@ -17,7 +18,8 @@ from .realtime import QwenRealtimeProvider, realtime_available
 class GatewayConnection:
     def __init__(self, websocket: WebSocket, user_id: str, conversation_id: str) -> None:
         self.websocket = websocket
-        self.session = SessionState(user_id=user_id, conversation_id=conversation_id)
+        model_config = runtime_model_config_for_user(user_id)
+        self.session = SessionState(user_id=user_id, conversation_id=conversation_id, model_config=model_config)
         self.pipeline = ConversationPipeline(self.session)
         self.generation_task: asyncio.Task[None] | None = None
         self.send_lock = asyncio.Lock()
@@ -27,8 +29,9 @@ class GatewayConnection:
                 self.send_provider_event,
                 self.record_realtime_user_transcript,
                 self.record_realtime_assistant_transcript,
+                model_config,
             )
-            if realtime_available()
+            if model_config and realtime_available(model_config)
             else None
         )
 

@@ -36,6 +36,7 @@ class Settings:
     ).rstrip("/")
     omni_realtime_model: str = getenv("OMNI_REALTIME_MODEL", "qwen3-omni-flash-realtime")
     omni_realtime_voice: str = getenv("OMNI_REALTIME_VOICE", "Cherry")
+    omni_realtime_vad_silence_ms: int = int(getenv("OMNI_REALTIME_VAD_SILENCE_MS", "1600"))
     vision_api_key: str = getenv("VISION_API_KEY", "")
     vision_base_url: str = getenv(
         "VISION_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"

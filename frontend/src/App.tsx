@@ -7,6 +7,7 @@ import {
   CircleStop,
   Eye,
   History,
+  KeyRound,
   MessageSquare,
   Mic,
   PanelLeftClose,
@@ -14,6 +15,7 @@ import {
   Plus,
   Play,
   Radio,
+  RefreshCw,
   Settings,
   Shield,
   Square,
@@ -33,12 +35,16 @@ import {
   fetchConversationMessages,
   fetchConversations,
   fetchCurrentUser,
+  fetchModelConfig,
   loadStoredAuth,
   loginUser,
   registerUser,
   renameConversation,
   storeAuth,
+  updateModelConfig,
   type AuthSession,
+  type ModelConfig,
+  type ModelConfigUpdate,
   type PersistedConversation,
   type PersistedMessage,
 } from "./lib/api";
@@ -67,7 +73,7 @@ const emptyCost: CostSnapshot = {
   estimatedUnits: 0,
 };
 
-type AppView = "chat" | "cost" | "settings";
+type AppView = "chat" | "cost" | "settings" | "apiKeys";
 type AiState = "idle" | "listening" | "processing" | "speaking";
 type MediaAction = "start" | "stop" | null;
 type SessionMeta = {
@@ -1192,6 +1198,9 @@ export function App() {
             {activeView === "cost" && (
               <CostStation cost={cost} connectionState={connectionState} permissionStatus={permissionStatus} asrStatus={asrStatus} realtimeAudio={realtimeAudio} />
             )}
+            {activeView === "apiKeys" && (
+              <ApiKeyManagementView apiBaseUrl={apiBaseUrl} token={authSession.accessToken} />
+            )}
             {activeView === "settings" && (
               <SettingsView
                 gatewayUrl={gatewayUrl}
@@ -1300,6 +1309,7 @@ function IconSidebar({ activeView, setActiveView }: { activeView: AppView; setAc
   const items = [
     { view: "chat" as const, icon: Radio, label: "实时对话" },
     { view: "cost" as const, icon: BarChart3, label: "模型消耗" },
+    { view: "apiKeys" as const, icon: KeyRound, label: "API Key 管理" },
     { view: "settings" as const, icon: Settings, label: "用户设置" },
   ];
   return (
@@ -1564,7 +1574,13 @@ function TopBar({
     <header className="flex min-h-16 items-center justify-between gap-4 border-b border-slate-200 px-7 py-3 max-md:flex-col max-md:items-start max-md:px-4">
       <div>
         <h1 className="text-xl font-black tracking-tight">
-          {activeView === "chat" ? "AI 视觉对话助手" : activeView === "cost" ? "模型消耗中转站" : "用户设置"}
+          {activeView === "chat"
+            ? "AI 视觉对话助手"
+            : activeView === "cost"
+              ? "模型消耗中转站"
+              : activeView === "apiKeys"
+                ? "API Key 管理"
+                : "用户设置"}
         </h1>
         <p className="mt-0.5 text-xs font-semibold text-slate-500">Tailwind UI · WebSocket Gateway · Pipecat-ready Pipeline · 视觉关键帧</p>
       </div>
@@ -1908,6 +1924,239 @@ function AiStatusIndicator({ state }: { state: AiState }) {
         <small className="text-xs text-white/70">{state === "processing" ? "分析画面与上下文" : state === "speaking" ? "语音输出中" : "实时会话"}</small>
       </div>
     </div>
+  );
+}
+
+type ModelConfigForm = Omit<ModelConfigUpdate, "apiKey" | "clearApiKey"> & { apiKey: string };
+
+function modelConfigToForm(config: ModelConfig): ModelConfigForm {
+  return {
+    apiKey: "",
+    baseUrl: config.baseUrl,
+    chatModel: config.chatModel,
+    realtimeEnabled: config.realtimeEnabled,
+    realtimeBaseUrl: config.realtimeBaseUrl,
+    realtimeModel: config.realtimeModel,
+    realtimeVoice: config.realtimeVoice,
+  };
+}
+
+function keySourceLabel(config: ModelConfig | null) {
+  if (!config) return "读取中";
+  if (config.keySource === "user") return `用户密钥 ${config.keyPreview}`;
+  if (config.keySource === "environment") return "环境变量已配置";
+  return "尚未配置";
+}
+
+function ApiKeyManagementView({ apiBaseUrl, token }: { apiBaseUrl: string; token: string }) {
+  const [config, setConfig] = useState<ModelConfig | null>(null);
+  const [form, setForm] = useState<ModelConfigForm | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  const loadConfig = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const next = await fetchModelConfig(apiBaseUrl, token);
+      setConfig(next);
+      setForm(modelConfigToForm(next));
+    } catch (configError) {
+      setError(configError instanceof Error ? configError.message : "模型配置读取失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [apiBaseUrl, token]);
+
+  useEffect(() => {
+    void loadConfig();
+  }, [loadConfig]);
+
+  const updateForm = useCallback(
+    <Key extends keyof ModelConfigForm>(key: Key, value: ModelConfigForm[Key]) => {
+      setForm((current) => (current ? { ...current, [key]: value } : current));
+      setMessage("");
+    },
+    [],
+  );
+
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!form) return;
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const payload: ModelConfigUpdate = {
+        baseUrl: form.baseUrl,
+        chatModel: form.chatModel,
+        realtimeEnabled: form.realtimeEnabled,
+        realtimeBaseUrl: form.realtimeBaseUrl,
+        realtimeModel: form.realtimeModel,
+        realtimeVoice: form.realtimeVoice,
+      };
+      if (form.apiKey.trim()) payload.apiKey = form.apiKey.trim();
+      const next = await updateModelConfig(apiBaseUrl, token, payload);
+      setConfig(next);
+      setForm(modelConfigToForm(next));
+      setMessage("模型配置已保存，下次启动会话时生效。");
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "模型配置保存失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const clearUserKey = async () => {
+    if (!form || !window.confirm("清除当前用户保存的 API Key？")) return;
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const next = await updateModelConfig(apiBaseUrl, token, {
+        ...form,
+        apiKey: undefined,
+        clearApiKey: true,
+      });
+      setConfig(next);
+      setForm(modelConfigToForm(next));
+      setMessage("用户 API Key 已清除，将回退到环境变量配置。");
+    } catch (clearError) {
+      setError(clearError instanceof Error ? clearError.message : "API Key 清除失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading || !form) {
+    return (
+      <section className="max-w-4xl rounded-[2rem] border border-slate-200 bg-white p-7 shadow-soft">
+        <p className="text-sm font-bold text-slate-500">正在读取模型配置...</p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="max-w-4xl rounded-[2rem] border border-slate-200 bg-white p-7 shadow-soft">
+      <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <div className="mb-3 inline-flex h-10 items-center gap-2 rounded-2xl bg-slate-100 px-3 text-sm font-black text-slate-700">
+            <KeyRound size={17} /> {keySourceLabel(config)}
+          </div>
+          <h2 className="text-2xl font-black">API Key 管理</h2>
+          <p className="mt-2 max-w-2xl text-sm font-semibold leading-6 text-slate-500">
+            用户级配置会加密保存，并优先于服务端环境变量；已运行的会话不会被中途切换。
+          </p>
+        </div>
+        <button
+          className="inline-flex h-10 items-center gap-2 rounded-2xl border border-slate-200 px-4 text-sm font-black text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          disabled={saving}
+          onClick={() => void loadConfig()}
+          type="button"
+        >
+          <RefreshCw size={16} /> 刷新
+        </button>
+      </div>
+
+      <form className="grid gap-5" onSubmit={save}>
+        <label className="grid gap-2 text-sm font-bold text-slate-600">
+          API Key
+          <input
+            className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400"
+            onChange={(event) => updateForm("apiKey", event.target.value)}
+            placeholder={config?.keyConfigured ? "留空则保留当前密钥" : "输入供应商 API Key"}
+            type="password"
+            value={form.apiKey}
+          />
+        </label>
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <label className="grid gap-2 text-sm font-bold text-slate-600">
+            Chat Base URL
+            <input
+              className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400"
+              onChange={(event) => updateForm("baseUrl", event.target.value)}
+              required
+              value={form.baseUrl}
+            />
+          </label>
+          <label className="grid gap-2 text-sm font-bold text-slate-600">
+            Chat / Vision 模型
+            <input
+              className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400"
+              onChange={(event) => updateForm("chatModel", event.target.value)}
+              required
+              value={form.chatModel}
+            />
+          </label>
+          <label className="grid gap-2 text-sm font-bold text-slate-600">
+            Realtime Base URL
+            <input
+              className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400 disabled:opacity-50"
+              disabled={!form.realtimeEnabled}
+              onChange={(event) => updateForm("realtimeBaseUrl", event.target.value)}
+              required
+              value={form.realtimeBaseUrl}
+            />
+          </label>
+          <label className="grid gap-2 text-sm font-bold text-slate-600">
+            Realtime 模型
+            <input
+              className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400 disabled:opacity-50"
+              disabled={!form.realtimeEnabled}
+              onChange={(event) => updateForm("realtimeModel", event.target.value)}
+              required
+              value={form.realtimeModel}
+            />
+          </label>
+        </div>
+
+        <div className="grid gap-4 rounded-3xl bg-slate-50 p-4 md:grid-cols-[1fr_1fr]">
+          <label className="flex items-center gap-3 text-sm font-black text-slate-700">
+            <input
+              checked={form.realtimeEnabled}
+              className="h-5 w-5 accent-slate-950"
+              onChange={(event) => updateForm("realtimeEnabled", event.target.checked)}
+              type="checkbox"
+            />
+            启用 Realtime 音频模型
+          </label>
+          <label className="grid gap-2 text-sm font-bold text-slate-600">
+            Realtime 音色
+            <select
+              className="h-11 rounded-2xl border border-slate-200 bg-white px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400"
+              onChange={(event) => updateForm("realtimeVoice", event.target.value)}
+              value={form.realtimeVoice}
+            >
+              {realtimeVoices.map((voice) => (
+                <option key={voice} value={voice}>
+                  {voice}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        {message && <p className="rounded-2xl bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-700">{message}</p>}
+        {error && <p className="rounded-2xl bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{error}</p>}
+
+        <div className="flex flex-wrap justify-end gap-3">
+          <button
+            className="h-11 rounded-2xl border border-slate-200 px-4 text-sm font-black text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+            disabled={saving || config?.keySource !== "user"}
+            onClick={() => void clearUserKey()}
+            type="button"
+          >
+            清除用户密钥
+          </button>
+          <button className="h-11 rounded-2xl bg-slate-950 px-5 text-sm font-black text-white disabled:opacity-50" disabled={saving} type="submit">
+            {saving ? "保存中..." : "保存配置"}
+          </button>
+        </div>
+      </form>
+    </section>
   );
 }
 
