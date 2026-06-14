@@ -29,6 +29,7 @@ import { PcmStreamPlayer } from "./lib/pcmPlayer";
 import {
   createConversation,
   deleteConversation,
+  fetchConversation,
   fetchConversationMessages,
   fetchConversations,
   fetchCurrentUser,
@@ -47,6 +48,7 @@ import type { ChatMessage, CostSnapshot, GatewayEvent, VadSnapshot } from "./typ
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
 const SPEECH_AUTO_SEND_DELAY_MS = 1200;
 const DUPLICATE_SPEECH_WINDOW_MS = 1800;
+const NEW_SESSION_BUSY_ID = "__new_session__";
 const BLUR_THRESHOLD = 80;
 const VOICE_STORAGE_KEY = "ai-vision-realtime-voice";
 const realtimeVoices = ["Cherry", "Serena", "Ethan", "Chelsie"] as const;
@@ -269,6 +271,27 @@ export function App() {
       }));
     },
     [apiBaseUrl, authSession?.accessToken],
+  );
+
+  const refreshConversationMeta = useCallback(
+    async (conversationId = currentSessionId, token = authSession?.accessToken, syncCost = conversationId === currentSessionId) => {
+      if (!token || !conversationId) return;
+      try {
+        const conversation = await fetchConversation(apiBaseUrl, token, conversationId);
+        const nextSession = conversationToSession(conversation);
+        setSessions((current) =>
+          current.some((session) => session.id === conversation.id)
+            ? current.map((session) => (session.id === conversation.id ? nextSession : session))
+            : [nextSession, ...current],
+        );
+        if (syncCost && isCostSnapshot(conversation.latestCost)) {
+          setCost(conversation.latestCost);
+        }
+      } catch {
+        // Keep the active conversation usable even if a background refresh fails.
+      }
+    },
+    [apiBaseUrl, authSession?.accessToken, currentSessionId],
   );
 
   useEffect(() => {
@@ -614,6 +637,7 @@ export function App() {
         void ensureAudioPlayer().play(event.audio, event.sampleRate);
       }
       if (event.type === "response.audio.done") {
+        void refreshConversationMeta();
         if (!modelAudioPlayingRef.current && !assistantMessageIdRef.current) setAiState(runningRef.current ? "listening" : "idle");
       }
       if (event.type === "tts.audio.chunk") {
@@ -623,7 +647,10 @@ export function App() {
         }
         if (!realtimeAudioRef.current) enqueueSpeech(event.text);
       }
-      if (event.type === "llm.done") finishAssistant(event.cancelled);
+      if (event.type === "llm.done") {
+        finishAssistant(event.cancelled);
+        if (!event.cancelled) void refreshConversationMeta();
+      }
       if (event.type === "speech.cancelled") {
         stopModelAudio();
         stopSpeech();
@@ -633,7 +660,18 @@ export function App() {
       if (event.type === "session.cost") setCost(event.cost);
       if (event.type === "error") setLastError(`${event.code}: ${event.message}`);
     },
-    [appendMessage, beginAssistantResponse, currentSessionId, enqueueSpeech, ensureAudioPlayer, finishAssistant, stopModelAudio, stopSpeech, updateAssistantDelta],
+    [
+      appendMessage,
+      beginAssistantResponse,
+      currentSessionId,
+      enqueueSpeech,
+      ensureAudioPlayer,
+      finishAssistant,
+      refreshConversationMeta,
+      stopModelAudio,
+      stopSpeech,
+      updateAssistantDelta,
+    ],
   );
 
   useEffect(() => client.on(handleGatewayEvent), [client, handleGatewayEvent]);
@@ -913,32 +951,51 @@ export function App() {
 
   const startNewConversation = useCallback(async () => {
     if (!authSession?.accessToken) return;
-    if (runningRef.current) await stopSession();
-    if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+    setHistoryBusySessionId(NEW_SESSION_BUSY_ID);
     setHistoryError("");
-    const conversation = await createConversation(apiBaseUrl, authSession.accessToken, "新会话");
-    setSessionMessages((store) => ({ ...store, [conversation.id]: createStarterMessages() }));
-    setSessions((current) => [conversationToSession(conversation), ...current]);
-    setCurrentSessionId(conversation.id);
-    setPartial("");
-    setManualText("");
-    setCost(emptyCost);
-    setActiveView("chat");
+    try {
+      if (runningRef.current) await stopSession();
+      if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+      const conversation = await createConversation(apiBaseUrl, authSession.accessToken, "新会话");
+      setSessionMessages((store) => ({ ...store, [conversation.id]: createStarterMessages() }));
+      setSessions((current) => [conversationToSession(conversation), ...current]);
+      setCurrentSessionId(conversation.id);
+      setPartial("");
+      setManualText("");
+      setCost(emptyCost);
+      setActiveView("chat");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "创建会话失败";
+      setHistoryError(message);
+      setLastError(message);
+    } finally {
+      setHistoryBusySessionId(null);
+    }
   }, [apiBaseUrl, authSession?.accessToken, cancel, stopSession]);
 
   const selectConversation = useCallback(
     async (id: string) => {
       if (id === currentSessionId) return;
-      if (runningRef.current) await stopSession();
-      if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+      setHistoryBusySessionId(id);
       setHistoryError("");
-      if (!sessionMessages[id]) await loadConversation(id);
-      setCurrentSessionId(id);
-      setPartial("");
-      setManualText("");
-      setActiveView("chat");
+      try {
+        if (runningRef.current) await stopSession();
+        if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+        if (!sessionMessages[id]) await loadConversation(id);
+        await refreshConversationMeta(id, undefined, true);
+        setCurrentSessionId(id);
+        setPartial("");
+        setManualText("");
+        setActiveView("chat");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "切换会话失败";
+        setHistoryError(message);
+        setLastError(message);
+      } finally {
+        setHistoryBusySessionId(null);
+      }
     },
-    [cancel, currentSessionId, loadConversation, sessionMessages, stopSession],
+    [cancel, currentSessionId, loadConversation, refreshConversationMeta, sessionMessages, stopSession],
   );
 
   const renameSession = useCallback(
@@ -1276,13 +1333,16 @@ function HistoryRail({
           className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50"
           onClick={onToggle}
           title="展开历史记录"
+          type="button"
         >
           <PanelLeftOpen size={18} />
         </button>
         <button
-          className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50"
+          className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+          disabled={busySessionId === NEW_SESSION_BUSY_ID}
           onClick={() => void onNewSession()}
           title="新会话"
+          type="button"
         >
           <Plus size={18} />
         </button>
@@ -1293,10 +1353,15 @@ function HistoryRail({
   return (
     <aside className="border-r border-slate-200 bg-slate-100/80 p-4 max-lg:hidden">
       <div className="mb-5 flex gap-2">
-        <button className="flex h-11 flex-1 items-center gap-2 rounded-2xl bg-white px-4 text-sm font-bold text-slate-800 shadow-sm" onClick={() => void onNewSession()}>
-          <Plus size={17} /> 新会话
+        <button
+          className="flex h-11 flex-1 items-center gap-2 rounded-2xl bg-white px-4 text-sm font-bold text-slate-800 shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
+          disabled={busySessionId === NEW_SESSION_BUSY_ID}
+          onClick={() => void onNewSession()}
+          type="button"
+        >
+          <Plus size={17} /> {busySessionId === NEW_SESSION_BUSY_ID ? "创建中..." : "新会话"}
         </button>
-        <button className="grid h-11 w-11 place-items-center rounded-2xl bg-white text-slate-600 shadow-sm hover:bg-slate-50" onClick={onToggle} title="收起历史记录">
+        <button className="grid h-11 w-11 place-items-center rounded-2xl bg-white text-slate-600 shadow-sm hover:bg-slate-50" onClick={onToggle} title="收起历史记录" type="button">
           <PanelLeftClose size={18} />
         </button>
       </div>
