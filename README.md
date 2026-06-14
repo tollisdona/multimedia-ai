@@ -18,16 +18,11 @@
 - SQLite 会话、消息、成本快照和使用统计
 - 成本控制：关键帧缓存、非连续视频上传、打断取消、TTS 字符统计、token 估算
 
-## Interaction Policy
+## 演示地址
+https://www.bilibili.com/video/BV1ZyJK6NERM/
+## 设计文档
 
-The current product policy is explicit visual input by default:
-
-- Opening the camera only enables local preview; it does not mean every message includes an image.
-- VAD detects speech lifecycle and supports barge-in, but VAD `speechStart` should not automatically capture camera frames.
-- Ordinary text or voice turns are sent as text/audio unless the user explicitly chooses a visual action.
-- Visual frames should be sent when the user clicks a visual quick prompt, chooses a "send with image" style action, or when a backend Agent emits `vision.capture.request`.
-- Broad keyword matching such as `看`, `这个`, or `那个` is intentionally avoided as the main trigger because it causes false positives in Chinese conversation.
-- Realtime image append is guarded by `audio_append_seen`; if a Qwen Realtime session has not received audio yet, images are cached/deferred rather than appended to the provider.
+- [Design review and implementation notes](docs/design-review.md)
 
 ## Architecture
 
@@ -282,9 +277,4 @@ cd frontend
 npm run build
 ```
 
-## Documentation
 
-- [Design review and implementation notes](docs/design-review.md)
-- [Video demo guide](docs/video-demo-guide.md)
-- [Medication Agent coding plan](docs/medication-agent-coding-plan.md)
-- [Original architecture design](docs/design.md)
