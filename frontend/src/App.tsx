@@ -3,6 +3,7 @@ import {
   ArrowUp,
   BarChart3,
   Camera,
+  Check,
   CircleStop,
   Eye,
   History,
@@ -16,31 +17,42 @@ import {
   Settings,
   Shield,
   Square,
+  Pencil,
+  Trash2,
   Volume2,
   Wifi,
   WifiOff,
+  X,
 } from "lucide-react";
 import { AudioCapture } from "./lib/audioCapture";
 import { PcmStreamPlayer } from "./lib/pcmPlayer";
 import {
   createConversation,
+  deleteConversation,
+  fetchConversation,
   fetchConversationMessages,
   fetchConversations,
   fetchCurrentUser,
   loadStoredAuth,
   loginUser,
   registerUser,
+  renameConversation,
   storeAuth,
   type AuthSession,
   type PersistedConversation,
   type PersistedMessage,
 } from "./lib/api";
 import { GatewayClient } from "./lib/wsClient";
-import type { ChatMessage, CostSnapshot, GatewayEvent } from "./types";
+import type { ChatMessage, CostSnapshot, GatewayEvent, VadSnapshot } from "./types";
 
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
 const SPEECH_AUTO_SEND_DELAY_MS = 1200;
 const DUPLICATE_SPEECH_WINDOW_MS = 1800;
+const NEW_SESSION_BUSY_ID = "__new_session__";
+const BLUR_THRESHOLD = 80;
+const VOICE_STORAGE_KEY = "ai-vision-realtime-voice";
+const realtimeVoices = ["Cherry", "Serena", "Ethan", "Chelsie"] as const;
+type RealtimeVoice = (typeof realtimeVoices)[number];
 
 const emptyCost: CostSnapshot = {
   audioSeconds: 0,
@@ -84,6 +96,11 @@ function timeLabel(timestamp = Date.now()) {
 
 function createStarterMessages(): ChatMessage[] {
   return [{ id: uid(), role: "system", text: "混合流式助手已就绪：音频全流式、文本流式、视觉关键帧准实时。" }];
+}
+
+function loadStoredVoice(): RealtimeVoice {
+  const stored = localStorage.getItem(VOICE_STORAGE_KEY);
+  return realtimeVoices.includes(stored as RealtimeVoice) ? (stored as RealtimeVoice) : "Cherry";
 }
 
 function gatewayUrlWithToken(url: string, token?: string, conversationId?: string) {
@@ -149,9 +166,12 @@ export function App() {
   const lastSubmittedSpeechRef = useRef<{ text: string; at: number } | null>(null);
   const lastSampleRef = useRef<Uint8ClampedArray | null>(null);
   const lastVisionAtRef = useRef(0);
+  const speechFrameCountRef = useRef(0);
+  const lastSpeechFrameAtRef = useRef(0);
   const realtimeAudioRef = useRef(false);
   const modelAudioPlayingRef = useRef(false);
   const runningRef = useRef(false);
+  const aiStateRef = useRef<AiState>("idle");
 
   const [connectionState, setConnectionState] = useState("closed");
   const [sessionReady, setSessionReady] = useState(false);
@@ -174,10 +194,13 @@ export function App() {
   const [asrStatus, setAsrStatus] = useState("未启动");
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [aiState, setAiState] = useState<AiState>("idle");
+  const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(() => loadStoredVoice());
   const [realtimeAudio, setRealtimeAudio] = useState(false);
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [videoPanePercent, setVideoPanePercent] = useState(57.14);
   const [conversationsLoaded, setConversationsLoaded] = useState(false);
+  const [historyBusySessionId, setHistoryBusySessionId] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState("");
 
   const messages = sessionMessages[currentSessionId] ?? [];
   const setMessages = useCallback(
@@ -207,6 +230,10 @@ export function App() {
       })),
     [sessionMessages, sessions],
   );
+
+  useEffect(() => {
+    aiStateRef.current = aiState;
+  }, [aiState]);
 
   useEffect(() => {
     setSessions((current) =>
@@ -246,6 +273,27 @@ export function App() {
       }));
     },
     [apiBaseUrl, authSession?.accessToken],
+  );
+
+  const refreshConversationMeta = useCallback(
+    async (conversationId = currentSessionId, token = authSession?.accessToken, syncCost = conversationId === currentSessionId) => {
+      if (!token || !conversationId) return;
+      try {
+        const conversation = await fetchConversation(apiBaseUrl, token, conversationId);
+        const nextSession = conversationToSession(conversation);
+        setSessions((current) =>
+          current.some((session) => session.id === conversation.id)
+            ? current.map((session) => (session.id === conversation.id ? nextSession : session))
+            : [nextSession, ...current],
+        );
+        if (syncCost && isCostSnapshot(conversation.latestCost)) {
+          setCost(conversation.latestCost);
+        }
+      } catch {
+        // Keep the active conversation usable even if a background refresh fails.
+      }
+    },
+    [apiBaseUrl, authSession?.accessToken, currentSessionId],
   );
 
   useEffect(() => {
@@ -412,22 +460,57 @@ export function App() {
     window.speechSynthesis?.cancel();
   }, []);
 
-  const computeFrameDiff = useCallback(() => {
+  const interruptActiveSpeech = useCallback(
+    (reason = "barge_in") => {
+      client.send("speech.cancel", { reason });
+      clearPendingSpeech();
+      stopModelAudio();
+      stopSpeech();
+      if (assistantMessageIdRef.current) finishAssistant(true);
+      setAiState(runningRef.current ? "listening" : "idle");
+    },
+    [clearPendingSpeech, client, finishAssistant, stopModelAudio, stopSpeech],
+  );
+
+  const computeFrameStats = useCallback(() => {
     const video = videoRef.current;
     const sample = sampleRef.current;
-    if (!video || !sample) return 100;
+    if (!video || !sample) return { diff: 100, sharpness: 1000 };
     const context = sample.getContext("2d", { willReadFrequently: true });
-    if (!context) return 100;
+    if (!context) return { diff: 100, sharpness: 1000 };
     sample.width = 64;
     sample.height = 36;
     context.drawImage(video, 0, 0, sample.width, sample.height);
     const data = context.getImageData(0, 0, sample.width, sample.height).data;
     const previous = lastSampleRef.current;
     lastSampleRef.current = new Uint8ClampedArray(data);
-    if (!previous) return 100;
     let diff = 0;
-    for (let i = 0; i < data.length; i += 16) diff += Math.abs(data[i] - previous[i]);
-    return diff / (data.length / 16);
+    if (previous) {
+      for (let i = 0; i < data.length; i += 16) diff += Math.abs(data[i] - previous[i]);
+      diff /= data.length / 16;
+    } else {
+      diff = 100;
+    }
+    let laplacian = 0;
+    let count = 0;
+    for (let y = 1; y < sample.height - 1; y += 1) {
+      for (let x = 1; x < sample.width - 1; x += 1) {
+        const index = (y * sample.width + x) * 4;
+        const center = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+        const leftIndex = (y * sample.width + x - 1) * 4;
+        const rightIndex = (y * sample.width + x + 1) * 4;
+        const upIndex = ((y - 1) * sample.width + x) * 4;
+        const downIndex = ((y + 1) * sample.width + x) * 4;
+        const left = data[leftIndex] * 0.299 + data[leftIndex + 1] * 0.587 + data[leftIndex + 2] * 0.114;
+        const right = data[rightIndex] * 0.299 + data[rightIndex + 1] * 0.587 + data[rightIndex + 2] * 0.114;
+        const up = data[upIndex] * 0.299 + data[upIndex + 1] * 0.587 + data[upIndex + 2] * 0.114;
+        const down = data[downIndex] * 0.299 + data[downIndex + 1] * 0.587 + data[downIndex + 2] * 0.114;
+        const value = 4 * center - left - right - up - down;
+        laplacian += value * value;
+        count += 1;
+      }
+    }
+    return { diff, sharpness: count ? laplacian / count : 1000 };
   }, []);
 
   const captureFrame = useCallback(
@@ -436,7 +519,8 @@ export function App() {
       const canvas = canvasRef.current;
       if (!video || !canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return false;
       const now = Date.now();
-      const diff = computeFrameDiff();
+      const { diff, sharpness } = computeFrameStats();
+      if (sharpness < BLUR_THRESHOLD && reason !== "manual") return false;
       const shouldSend = force || reason === "semantic" || now - lastVisionAtRef.current > 12000 || diff > 18;
       if (!shouldSend) return false;
 
@@ -452,7 +536,7 @@ export function App() {
       if (sent) lastVisionAtRef.current = now;
       return sent;
     },
-    [client, computeFrameDiff],
+    [client, computeFrameStats],
   );
 
   const sendFinalTranscript = useCallback(
@@ -555,6 +639,7 @@ export function App() {
         void ensureAudioPlayer().play(event.audio, event.sampleRate);
       }
       if (event.type === "response.audio.done") {
+        void refreshConversationMeta();
         if (!modelAudioPlayingRef.current && !assistantMessageIdRef.current) setAiState(runningRef.current ? "listening" : "idle");
       }
       if (event.type === "tts.audio.chunk") {
@@ -564,16 +649,31 @@ export function App() {
         }
         if (!realtimeAudioRef.current) enqueueSpeech(event.text);
       }
-      if (event.type === "llm.done") finishAssistant(event.cancelled);
+      if (event.type === "llm.done") {
+        finishAssistant(event.cancelled);
+        if (!event.cancelled) void refreshConversationMeta();
+      }
       if (event.type === "speech.cancelled") {
         stopModelAudio();
         stopSpeech();
         finishAssistant(true);
       }
+      if (event.type === "voice.updated") setSelectedVoice(event.voice as RealtimeVoice);
       if (event.type === "session.cost") setCost(event.cost);
       if (event.type === "error") setLastError(`${event.code}: ${event.message}`);
     },
-    [appendMessage, beginAssistantResponse, currentSessionId, enqueueSpeech, ensureAudioPlayer, finishAssistant, stopModelAudio, stopSpeech, updateAssistantDelta],
+    [
+      appendMessage,
+      beginAssistantResponse,
+      currentSessionId,
+      enqueueSpeech,
+      ensureAudioPlayer,
+      finishAssistant,
+      refreshConversationMeta,
+      stopModelAudio,
+      stopSpeech,
+      updateAssistantDelta,
+    ],
   );
 
   useEffect(() => client.on(handleGatewayEvent), [client, handleGatewayEvent]);
@@ -588,7 +688,6 @@ export function App() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      if (runningRef.current) void captureFrame("periodic");
       if (runningRef.current && client.state === "closed") {
         setSessionReady(false);
         client.connect();
@@ -699,7 +798,42 @@ export function App() {
     },
     [],
   );
+  
+  const handleVad = useCallback(
+    (snapshot: VadSnapshot) => {
+      if (!runningRef.current) return;
 
+      if (snapshot.speechStart) {
+        const assistantIsSpeaking =
+          modelAudioPlayingRef.current ||
+          aiStateRef.current === "speaking" ||
+          ttsPlayingRef.current ||
+          ttsQueueRef.current.length > 0;
+
+        if (assistantIsSpeaking) interruptActiveSpeech("barge_in");
+
+        speechFrameCountRef.current = 1;
+        lastSpeechFrameAtRef.current = Date.now();
+        void captureFrame("speech-start", true);
+      }
+
+      if (snapshot.isSpeech && speechFrameCountRef.current > 0 && speechFrameCountRef.current < 2) {
+        const now = Date.now();
+        if (now - lastSpeechFrameAtRef.current > 1200) {
+          speechFrameCountRef.current += 1;
+          lastSpeechFrameAtRef.current = now;
+          void captureFrame("speech-active", true);
+        }
+      }
+
+      if (snapshot.speechEnd) {
+        speechFrameCountRef.current = 0;
+        lastSpeechFrameAtRef.current = 0;
+      }
+    },
+    [captureFrame, interruptActiveSpeech],
+  );
+  
   const startSession = useCallback(async () => {
     if (mediaAction || mediaState === "running") return;
     setMediaAction("start");
@@ -733,8 +867,9 @@ export function App() {
       client.connect();
       await client.waitOpen();
       client.send("session.start");
+      client.send("session.voice.update", { voice: selectedVoice });
 
-      const audioCapture = new AudioCapture(client, setLevel);
+      const audioCapture = new AudioCapture(client, setLevel, handleVad);
       await audioCapture.start(grantedStream);
       audioCaptureRef.current = audioCapture;
       runningRef.current = true;
@@ -742,7 +877,6 @@ export function App() {
       setMediaState("running");
       if (realtimeAudioRef.current) setAsrStatus("Qwen Realtime ASR");
       else startSpeechRecognition();
-      await captureFrame("startup", true);
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       let message = raw;
@@ -762,8 +896,7 @@ export function App() {
     } finally {
       setMediaAction(null);
     }
-  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, mediaAction, mediaState, startSpeechRecognition]);
-
+  }, [clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, mediaAction, mediaState, selectedVoice, startSpeechRecognition]);
   const stopSession = useCallback(async () => {
     if (mediaAction === "stop") return;
     setMediaAction("stop");
@@ -834,30 +967,131 @@ export function App() {
 
   const startNewConversation = useCallback(async () => {
     if (!authSession?.accessToken) return;
-    if (runningRef.current) await stopSession();
-    if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
-    const conversation = await createConversation(apiBaseUrl, authSession.accessToken, "新会话");
-    setSessionMessages((store) => ({ ...store, [conversation.id]: createStarterMessages() }));
-    setSessions((current) => [conversationToSession(conversation), ...current]);
-    setCurrentSessionId(conversation.id);
-    setPartial("");
-    setManualText("");
-    setCost(emptyCost);
-    setActiveView("chat");
+    setHistoryBusySessionId(NEW_SESSION_BUSY_ID);
+    setHistoryError("");
+    try {
+      if (runningRef.current) await stopSession();
+      if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+      const conversation = await createConversation(apiBaseUrl, authSession.accessToken, "新会话");
+      setSessionMessages((store) => ({ ...store, [conversation.id]: createStarterMessages() }));
+      setSessions((current) => [conversationToSession(conversation), ...current]);
+      setCurrentSessionId(conversation.id);
+      setPartial("");
+      setManualText("");
+      setCost(emptyCost);
+      setActiveView("chat");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "创建会话失败";
+      setHistoryError(message);
+      setLastError(message);
+    } finally {
+      setHistoryBusySessionId(null);
+    }
   }, [apiBaseUrl, authSession?.accessToken, cancel, stopSession]);
 
   const selectConversation = useCallback(
     async (id: string) => {
       if (id === currentSessionId) return;
-      if (runningRef.current) await stopSession();
-      if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
-      if (!sessionMessages[id]) await loadConversation(id);
-      setCurrentSessionId(id);
-      setPartial("");
-      setManualText("");
-      setActiveView("chat");
+      setHistoryBusySessionId(id);
+      setHistoryError("");
+      try {
+        if (runningRef.current) await stopSession();
+        if (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0) cancel();
+        if (!sessionMessages[id]) await loadConversation(id);
+        await refreshConversationMeta(id, undefined, true);
+        setCurrentSessionId(id);
+        setPartial("");
+        setManualText("");
+        setActiveView("chat");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "切换会话失败";
+        setHistoryError(message);
+        setLastError(message);
+      } finally {
+        setHistoryBusySessionId(null);
+      }
     },
-    [cancel, currentSessionId, loadConversation, sessionMessages, stopSession],
+    [cancel, currentSessionId, loadConversation, refreshConversationMeta, sessionMessages, stopSession],
+  );
+
+  const renameSession = useCallback(
+    async (id: string, title: string) => {
+      const clean = title.trim();
+      if (!authSession?.accessToken || !clean) return;
+      setHistoryBusySessionId(id);
+      setHistoryError("");
+      try {
+        const conversation = await renameConversation(apiBaseUrl, authSession.accessToken, id, clean);
+        setSessions((current) =>
+          current.map((session) =>
+            session.id === id
+              ? { ...session, title: conversation.title, updatedAt: timeLabel(conversation.updatedAt) }
+              : session,
+          ),
+        );
+      } catch (error) {
+        setHistoryError(error instanceof Error ? error.message : "重命名会话失败");
+        throw error;
+      } finally {
+        setHistoryBusySessionId(null);
+      }
+    },
+    [apiBaseUrl, authSession?.accessToken],
+  );
+
+  const deleteSession = useCallback(
+    async (id: string) => {
+      if (!authSession?.accessToken) return;
+      const deletingCurrent = id === currentSessionId;
+      const remaining = sessions.filter((session) => session.id !== id);
+      setHistoryBusySessionId(id);
+      setHistoryError("");
+      try {
+        if (deletingCurrent && runningRef.current) await stopSession();
+        if (deletingCurrent && (assistantMessageIdRef.current || ttsPlayingRef.current || ttsQueueRef.current.length > 0)) cancel();
+        await deleteConversation(apiBaseUrl, authSession.accessToken, id);
+        setSessions((current) => current.filter((session) => session.id !== id));
+        setSessionMessages((store) => {
+          const next = { ...store };
+          delete next[id];
+          return next;
+        });
+
+        if (!deletingCurrent) return;
+        const nextSession = remaining[0];
+        setPartial("");
+        setManualText("");
+        setCost(emptyCost);
+        if (nextSession) {
+          if (!sessionMessages[nextSession.id]) await loadConversation(nextSession.id);
+          setCurrentSessionId(nextSession.id);
+          setActiveView("chat");
+          return;
+        }
+
+        const conversation = await createConversation(apiBaseUrl, authSession.accessToken, "新会话");
+        setSessions([conversationToSession(conversation)]);
+        setSessionMessages((store) => ({ ...store, [conversation.id]: createStarterMessages() }));
+        setCurrentSessionId(conversation.id);
+        setActiveView("chat");
+      } catch (error) {
+        setHistoryError(error instanceof Error ? error.message : "删除会话失败");
+        throw error;
+      } finally {
+        setHistoryBusySessionId(null);
+      }
+    },
+    [
+      apiBaseUrl,
+      authSession?.accessToken,
+      cancel,
+      createConversation,
+      currentSessionId,
+      loadConversation,
+      sessionMessages,
+      sessions,
+      stopSession,
+    ],
   );
 
   const handleAuthenticated = useCallback((session: AuthSession) => {
@@ -872,6 +1106,15 @@ export function App() {
     storeAuth(null);
     setAuthError("");
   }, [stopSession]);
+
+  const updateVoice = useCallback(
+    (voice: RealtimeVoice) => {
+      setSelectedVoice(voice);
+      localStorage.setItem(VOICE_STORAGE_KEY, voice);
+      if (client.state === "open") client.send("session.voice.update", { voice });
+    },
+    [client],
+  );
 
   if (!authSession) {
     return <AuthView apiBaseUrl={apiBaseUrl} error={authError} onAuthenticated={handleAuthenticated} />;
@@ -889,9 +1132,13 @@ export function App() {
       >
         <IconSidebar activeView={activeView} setActiveView={setActiveView} />
         <HistoryRail
+          busySessionId={historyBusySessionId}
           collapsed={historyCollapsed}
           currentSessionId={currentSessionId}
+          error={historyError}
+          onDeleteSession={deleteSession}
           onNewSession={startNewConversation}
+          onRenameSession={renameSession}
           onSelectSession={selectConversation}
           onToggle={() => setHistoryCollapsed((current) => !current)}
           sessions={historySessions}
@@ -950,6 +1197,8 @@ export function App() {
                 gatewayUrl={gatewayUrl}
                 permissionStatus={permissionStatus}
                 asrStatus={asrStatus}
+                selectedVoice={selectedVoice}
+                setSelectedVoice={updateVoice}
                 user={authSession.user}
                 onLogout={logout}
               />
@@ -1076,16 +1325,24 @@ function IconSidebar({ activeView, setActiveView }: { activeView: AppView; setAc
 }
 
 function HistoryRail({
+  busySessionId,
   collapsed,
   currentSessionId,
+  error,
+  onDeleteSession,
   onNewSession,
+  onRenameSession,
   onSelectSession,
   onToggle,
   sessions,
 }: {
+  busySessionId: string | null;
   collapsed: boolean;
   currentSessionId: string;
+  error: string;
+  onDeleteSession: (id: string) => Promise<void>;
   onNewSession: () => Promise<void>;
+  onRenameSession: (id: string, title: string) => Promise<void>;
   onSelectSession: (id: string) => Promise<void>;
   onToggle: () => void;
   sessions: SessionListItem[];
@@ -1097,13 +1354,16 @@ function HistoryRail({
           className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50"
           onClick={onToggle}
           title="展开历史记录"
+          type="button"
         >
           <PanelLeftOpen size={18} />
         </button>
         <button
-          className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50"
+          className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+          disabled={busySessionId === NEW_SESSION_BUSY_ID}
           onClick={() => void onNewSession()}
           title="新会话"
+          type="button"
         >
           <Plus size={18} />
         </button>
@@ -1114,40 +1374,169 @@ function HistoryRail({
   return (
     <aside className="border-r border-slate-200 bg-slate-100/80 p-4 max-lg:hidden">
       <div className="mb-5 flex gap-2">
-        <button className="flex h-11 flex-1 items-center gap-2 rounded-2xl bg-white px-4 text-sm font-bold text-slate-800 shadow-sm" onClick={() => void onNewSession()}>
-          <Plus size={17} /> 新会话
+        <button
+          className="flex h-11 flex-1 items-center gap-2 rounded-2xl bg-white px-4 text-sm font-bold text-slate-800 shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
+          disabled={busySessionId === NEW_SESSION_BUSY_ID}
+          onClick={() => void onNewSession()}
+          type="button"
+        >
+          <Plus size={17} /> {busySessionId === NEW_SESSION_BUSY_ID ? "创建中..." : "新会话"}
         </button>
-        <button className="grid h-11 w-11 place-items-center rounded-2xl bg-white text-slate-600 shadow-sm hover:bg-slate-50" onClick={onToggle} title="收起历史记录">
+        <button className="grid h-11 w-11 place-items-center rounded-2xl bg-white text-slate-600 shadow-sm hover:bg-slate-50" onClick={onToggle} title="收起历史记录" type="button">
           <PanelLeftClose size={18} />
         </button>
       </div>
       <div className="mb-3 flex items-center gap-2 text-xs font-black uppercase tracking-wide text-slate-500">
         <History size={15} /> 历史记录
       </div>
+      {error && <p className="mb-3 rounded-2xl bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700">{error}</p>}
       <div className="space-y-2">
         {sessions.length === 0 ? (
           <p className="rounded-2xl border border-dashed border-slate-300 p-4 text-sm text-slate-500">暂无会话历史</p>
         ) : (
           sessions.map((session) => (
-            <button
+            <HistorySessionItem
               key={session.id}
-              className={cx(
-                "w-full rounded-2xl px-3 py-3 text-left transition",
-                session.id === currentSessionId ? "bg-white text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white",
-              )}
-              onClick={() => void onSelectSession(session.id)}
-            >
-              <span className="flex items-center gap-2 text-sm font-black">
-                <MessageSquare size={15} /> {session.title}
-              </span>
-              <span className="mt-1 block text-xs font-semibold text-slate-400">
-                {session.updatedAt} · {session.messageCount} 条消息
-              </span>
-            </button>
+              active={session.id === currentSessionId}
+              busy={busySessionId === session.id}
+              onDeleteSession={onDeleteSession}
+              onRenameSession={onRenameSession}
+              onSelectSession={onSelectSession}
+              session={session}
+            />
           ))
         )}
       </div>
     </aside>
+  );
+}
+
+function HistorySessionItem({
+  active,
+  busy,
+  onDeleteSession,
+  onRenameSession,
+  onSelectSession,
+  session,
+}: {
+  active: boolean;
+  busy: boolean;
+  onDeleteSession: (id: string) => Promise<void>;
+  onRenameSession: (id: string, title: string) => Promise<void>;
+  onSelectSession: (id: string) => Promise<void>;
+  session: SessionListItem;
+}) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [draftTitle, setDraftTitle] = useState(session.title);
+
+  useEffect(() => {
+    if (!isEditing) setDraftTitle(session.title);
+  }, [isEditing, session.title]);
+
+  const submitRename = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const clean = draftTitle.trim();
+    if (!clean || clean === session.title) {
+      setIsEditing(false);
+      setDraftTitle(session.title);
+      return;
+    }
+    try {
+      await onRenameSession(session.id, clean);
+      setIsEditing(false);
+    } catch {
+      // Error is rendered by the history rail.
+    }
+  };
+
+  const deleteCurrentSession = async () => {
+    if (!window.confirm(`删除会话「${session.title}」？`)) return;
+    try {
+      await onDeleteSession(session.id);
+    } catch {
+      // Error is rendered by the history rail.
+    }
+  };
+
+  return (
+    <article
+      className={cx(
+        "rounded-2xl px-3 py-3 transition",
+        active ? "bg-white text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white",
+      )}
+    >
+      {isEditing ? (
+        <form className="grid gap-2" onSubmit={submitRename}>
+          <input
+            autoFocus
+            className="h-9 rounded-xl border border-slate-200 bg-white px-3 text-sm font-bold text-slate-900 outline-none focus:border-cyan-400"
+            disabled={busy}
+            maxLength={80}
+            onChange={(event) => setDraftTitle(event.target.value)}
+            value={draftTitle}
+          />
+          <div className="flex justify-end gap-1">
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl text-slate-500 hover:bg-slate-100 disabled:opacity-50"
+              disabled={busy}
+              onClick={() => {
+                setIsEditing(false);
+                setDraftTitle(session.title);
+              }}
+              title="取消重命名"
+              type="button"
+            >
+              <X size={16} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl bg-slate-950 text-white disabled:opacity-50"
+              disabled={busy || !draftTitle.trim()}
+              title="保存会话名称"
+              type="submit"
+            >
+              <Check size={16} />
+            </button>
+          </div>
+        </form>
+      ) : (
+        <div className="flex items-start gap-2">
+          <button
+            className="min-w-0 flex-1 text-left"
+            disabled={busy}
+            onClick={() => void onSelectSession(session.id)}
+            type="button"
+          >
+            <span className="flex min-w-0 items-center gap-2 text-sm font-black">
+              <MessageSquare className="shrink-0" size={15} />
+              <span className="truncate">{session.title}</span>
+            </span>
+            <span className="mt-1 block text-xs font-semibold text-slate-400">
+              {session.updatedAt} · {session.messageCount} 条消息
+            </span>
+          </button>
+          <div className="flex shrink-0 gap-1">
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50"
+              disabled={busy}
+              onClick={() => setIsEditing(true)}
+              title="重命名会话"
+              type="button"
+            >
+              <Pencil size={15} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-xl text-slate-400 hover:bg-rose-50 hover:text-rose-700 disabled:opacity-50"
+              disabled={busy}
+              onClick={() => void deleteCurrentSession()}
+              title="删除会话"
+              type="button"
+            >
+              <Trash2 size={15} />
+            </button>
+          </div>
+        </div>
+      )}
+    </article>
   );
 }
 
@@ -1561,12 +1950,16 @@ function SettingsView({
   gatewayUrl,
   permissionStatus,
   asrStatus,
+  selectedVoice,
+  setSelectedVoice,
   user,
   onLogout,
 }: {
   gatewayUrl: string;
   permissionStatus: string;
   asrStatus: string;
+  selectedVoice: RealtimeVoice;
+  setSelectedVoice: (voice: RealtimeVoice) => void;
   user: AuthSession["user"];
   onLogout: () => Promise<void>;
 }) {
@@ -1586,6 +1979,25 @@ function SettingsView({
         <ReadonlyField label="Gateway 地址" value={gatewayUrl} />
         <ReadonlyField label="权限状态" value={permissionStatus} />
         <ReadonlyField label="语音识别" value={asrStatus} />
+        <div className="rounded-2xl bg-slate-50 px-4 py-3">
+          <span className="text-xs font-black text-slate-400">Realtime 音色</span>
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {realtimeVoices.map((voice) => (
+              <button
+                key={voice}
+                className={cx(
+                  "h-10 rounded-2xl text-sm font-black transition",
+                  selectedVoice === voice ? "bg-slate-950 text-white" : "bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-100",
+                )}
+                onClick={() => setSelectedVoice(voice)}
+                type="button"
+              >
+                {voice}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-xs font-semibold text-slate-500">音色会保存到本机，并在会话启动或切换时同步给 Realtime Gateway。</p>
+        </div>
       </div>
     </section>
   );
