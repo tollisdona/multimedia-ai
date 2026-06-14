@@ -186,6 +186,7 @@ export function App() {
   const [asrStatus, setAsrStatus] = useState("未启动");
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [aiState, setAiState] = useState<AiState>("idle");
+  const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(() => loadStoredVoice());
   const [realtimeAudio, setRealtimeAudio] = useState(false);
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [videoPanePercent, setVideoPanePercent] = useState(57.14);
