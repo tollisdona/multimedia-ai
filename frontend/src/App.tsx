@@ -162,6 +162,8 @@ export function App() {
   const lastSubmittedSpeechRef = useRef<{ text: string; at: number } | null>(null);
   const lastSampleRef = useRef<Uint8ClampedArray | null>(null);
   const lastVisionAtRef = useRef(0);
+  const speechFrameCountRef = useRef(0);
+  const lastSpeechFrameAtRef = useRef(0);
   const realtimeAudioRef = useRef(false);
   const modelAudioPlayingRef = useRef(false);
   const runningRef = useRef(false);
@@ -444,19 +446,6 @@ export function App() {
     [clearPendingSpeech, client, finishAssistant, stopModelAudio, stopSpeech],
   );
 
-  const handleVad = useCallback(
-    (snapshot: VadSnapshot) => {
-      if (!runningRef.current || !snapshot.speechStart) return;
-      const assistantIsSpeaking =
-        modelAudioPlayingRef.current ||
-        aiStateRef.current === "speaking" ||
-        ttsPlayingRef.current ||
-        ttsQueueRef.current.length > 0;
-      if (assistantIsSpeaking) interruptActiveSpeech("barge_in");
-    },
-    [interruptActiveSpeech],
-  );
-
   const computeFrameDiff = useCallback(() => {
     const video = videoRef.current;
     const sample = sampleRef.current;
@@ -634,7 +623,6 @@ export function App() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      if (runningRef.current) void captureFrame("periodic");
       if (runningRef.current && client.state === "closed") {
         setSessionReady(false);
         client.connect();
@@ -745,7 +733,42 @@ export function App() {
     },
     [],
   );
+  
+  const handleVad = useCallback(
+    (snapshot: VadSnapshot) => {
+      if (!runningRef.current) return;
 
+      if (snapshot.speechStart) {
+        const assistantIsSpeaking =
+          modelAudioPlayingRef.current ||
+          aiStateRef.current === "speaking" ||
+          ttsPlayingRef.current ||
+          ttsQueueRef.current.length > 0;
+
+        if (assistantIsSpeaking) interruptActiveSpeech("barge_in");
+
+        speechFrameCountRef.current = 1;
+        lastSpeechFrameAtRef.current = Date.now();
+        void captureFrame("speech-start", true);
+      }
+
+      if (snapshot.isSpeech && speechFrameCountRef.current > 0 && speechFrameCountRef.current < 2) {
+        const now = Date.now();
+        if (now - lastSpeechFrameAtRef.current > 1200) {
+          speechFrameCountRef.current += 1;
+          lastSpeechFrameAtRef.current = now;
+          void captureFrame("speech-active", true);
+        }
+      }
+
+      if (snapshot.speechEnd) {
+        speechFrameCountRef.current = 0;
+        lastSpeechFrameAtRef.current = 0;
+      }
+    },
+    [captureFrame, interruptActiveSpeech],
+  );
+  
   const startSession = useCallback(async () => {
     let grantedStream: MediaStream | null = null;
     try {
@@ -787,7 +810,6 @@ export function App() {
       setMediaState("running");
       if (realtimeAudioRef.current) setAsrStatus("Qwen Realtime ASR");
       else startSpeechRecognition();
-      await captureFrame("startup", true);
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       let message = raw;
@@ -805,9 +827,8 @@ export function App() {
       setMediaState("error");
       setConnectionState(client.state);
     }
-  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, selectedVoice, handleVad, startSpeechRecognition]);
-
-
+  }, [clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, selectedVoice, startSpeechRecognition]);
+  
   const stopSession = useCallback(async () => {
     runningRef.current = false;
     clearPendingSpeech();
