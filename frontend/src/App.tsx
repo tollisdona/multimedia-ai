@@ -71,6 +71,7 @@ const NEW_SESSION_BUSY_ID = "__new_session__";
 const BLUR_THRESHOLD = 80;
 const MAX_REALTIME_IMAGE_BASE64_BYTES = 240 * 1024;
 const MAX_OCR_IMAGE_BASE64_BYTES = 800 * 1024;
+const ELECTRONIC_TTS_ENABLED = false;
 const VOICE_STORAGE_KEY = "ai-vision-realtime-voice";
 const realtimeVoices = ["Cherry", "Serena", "Ethan", "Chelsie"] as const;
 type RealtimeVoice = (typeof realtimeVoices)[number];
@@ -226,6 +227,7 @@ export function App() {
   const ttsPlayingRef = useRef(false);
   const ttsAsrSuppressedUntilRef = useRef(0);
   const ttsReleaseTimerRef = useRef(0);
+  const medicationCaptureTimerRef = useRef(0);
   const recognitionPausedForTtsRef = useRef(false);
   const recognitionDisabledRef = useRef(false);
   const recognitionRestartTimerRef = useRef(0);
@@ -488,53 +490,14 @@ export function App() {
   );
 
   const processTtsQueue = useCallback(() => {
-    if (ttsPlayingRef.current) return;
-    const next = ttsQueueRef.current.shift();
-    if (!next || !("speechSynthesis" in window)) {
-      const releaseInMs = ttsAsrSuppressedUntilRef.current - Date.now();
-      if (releaseInMs > 0) {
-        window.clearTimeout(ttsReleaseTimerRef.current);
-        ttsReleaseTimerRef.current = window.setTimeout(() => processTtsQueue(), releaseInMs);
-        return;
-      }
-      recognitionPausedForTtsRef.current = false;
-      if (runningRef.current && !recognitionDisabledRef.current) {
-        window.clearTimeout(recognitionRestartTimerRef.current);
-        recognitionRestartTimerRef.current = window.setTimeout(() => recognitionStarterRef.current(), 250);
-      }
-      setAiState(runningRef.current ? "listening" : "idle");
-      return;
-    }
-    recognitionPausedForTtsRef.current = true;
-    suppressAsrForTts();
-    window.clearTimeout(ttsReleaseTimerRef.current);
-    clearPendingSpeech();
-    try {
-      recognitionRef.current?.stop?.();
-    } catch {
-      // Browser may throw if recognition is already stopped.
-    }
-    ttsPlayingRef.current = true;
-    setAiState("speaking");
-    const utterance = new SpeechSynthesisUtterance(next);
-    utterance.lang = "zh-CN";
-    utterance.rate = 0.98;
-    utterance.pitch = 1;
-    utterance.onend = () => {
-      ttsPlayingRef.current = false;
-      suppressAsrForTts();
-      processTtsQueue();
-    };
-    utterance.onerror = () => {
-      ttsPlayingRef.current = false;
-      suppressAsrForTts();
-      processTtsQueue();
-    };
-    window.speechSynthesis.speak(utterance);
-  }, [clearPendingSpeech, suppressAsrForTts]);
+    ttsQueueRef.current = [];
+    ttsPlayingRef.current = false;
+    recognitionPausedForTtsRef.current = false;
+  }, []);
 
   const enqueueSpeech = useCallback(
     (text: string) => {
+      if (!ELECTRONIC_TTS_ENABLED) return;
       if (!text.trim()) return;
       ttsQueueRef.current.push(text.trim());
       processTtsQueue();
@@ -549,7 +512,6 @@ export function App() {
     window.clearTimeout(ttsReleaseTimerRef.current);
     recognitionPausedForTtsRef.current = false;
     setAiState(runningRef.current ? "listening" : "idle");
-    window.speechSynthesis?.cancel();
   }, []);
 
   const interruptActiveSpeech = useCallback(
@@ -698,6 +660,62 @@ export function App() {
     [appendMessage, cameraStatus, client],
   );
 
+  const sendRealtimeVisualPrompt = useCallback(
+    async (text: string) => {
+      const clean = text.trim();
+      if (!clean) return false;
+      if (mediaState !== "running" || !realtimeAudioRef.current) {
+        appendMessage({ id: uid(), role: "system", text: "请先开启实时对话；视觉快捷提问需要使用实时模型返回音频流。" });
+        setLastError("视觉快捷提问需要先开启实时对话，并使用支持音频流的实时模型。");
+        return false;
+      }
+      if (cameraStatus !== "active") {
+        appendMessage({ id: uid(), role: "system", text: "请先开启摄像头，视觉快捷提问需要携带当前画面。" });
+        setLastError("视觉快捷提问需要先开启摄像头。");
+        return false;
+      }
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      if (!video || !canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        appendMessage({ id: uid(), role: "system", text: "当前摄像头画面还没有准备好，请稍后再试。" });
+        return false;
+      }
+      const context = canvas.getContext("2d");
+      if (!context) return false;
+
+      const widths = [720, 640, 520, 420];
+      const qualities = [0.72, 0.62, 0.52, 0.42];
+      let image = "";
+      for (const width of widths) {
+        const height = Math.round((video.videoHeight / Math.max(video.videoWidth, 1)) * width) || Math.round(width * 0.5625);
+        canvas.width = width;
+        canvas.height = height;
+        context.drawImage(video, 0, 0, width, height);
+        for (const imageQuality of qualities) {
+          image = canvas.toDataURL("image/jpeg", imageQuality);
+          if (imagePayloadSize(image) <= MAX_REALTIME_IMAGE_BASE64_BYTES) break;
+        }
+        if (imagePayloadSize(image) <= MAX_REALTIME_IMAGE_BASE64_BYTES) break;
+      }
+
+      clearPendingSpeech();
+      stopModelAudio();
+      if (assistantMessageIdRef.current) finishAssistant(true);
+      setAiState("processing");
+      const sent = client.send("realtime.visual.prompt", {
+        text: clean,
+        image,
+        reason: "visual-quick-prompt",
+      });
+      if (!sent) {
+        appendMessage({ id: uid(), role: "system", text: "实时连接还没准备好，请稍后再试。" });
+        return false;
+      }
+      return true;
+    },
+    [appendMessage, cameraStatus, clearPendingSpeech, client, finishAssistant, mediaState, stopModelAudio],
+  );
+
   const captureSpeechFrame = useCallback(
     (reason: "speech-start" | "speech-active") => {
       window.clearTimeout(pendingSpeechFrameTimerRef.current);
@@ -723,10 +741,13 @@ export function App() {
         stopSpeech();
         finishAssistant(true);
       }
-      if (containsVisualIntent(clean) && !containsMedicationInstructionIntent(clean)) await captureFrame("semantic", true);
+      if (containsVisualIntent(clean) && !containsMedicationInstructionIntent(clean)) {
+        await sendRealtimeVisualPrompt(clean);
+        return;
+      }
       client.send("browser.asr.final", { text: clean });
     },
-    [captureFrame, client, finishAssistant, stopSpeech],
+    [client, finishAssistant, sendRealtimeVisualPrompt, stopSpeech],
   );
 
   const submitRecognizedSpeech = useCallback(
@@ -785,21 +806,23 @@ export function App() {
       }
       if (event.type === "agent.guidance") {
         clearEmptyAssistantPlaceholder();
-        appendMessage({ id: uid(), role: "assistant", text: event.text });
-        if (event.speak) enqueueSpeech(event.text);
+        appendMessage({ id: uid(), role: "system", text: event.text });
       }
       if (event.type === "vision.capture.request") {
         clearEmptyAssistantPlaceholder();
-        void captureFrameForRequest(event.requestId, event.reason, event.quality);
+        window.clearTimeout(medicationCaptureTimerRef.current);
+        medicationCaptureTimerRef.current = window.setTimeout(() => {
+          void captureFrameForRequest(event.requestId, event.reason, event.quality);
+        }, 0);
       }
       if (event.type === "ocr.started") {
-        appendMessage({ id: uid(), role: "system", text: "正在识别说明书文字..." });
+        appendMessage({ id: uid(), role: "system", text: "已完成截图，正在识别说明书文字..." });
       }
       if (event.type === "ocr.result") {
         const confidence = event.confidence == null ? "" : `，置信度 ${(event.confidence * 100).toFixed(0)}%`;
         const text = event.accepted
-          ? `已读取到可用文字${confidence}，正在基于说明书整理回答。`
-          : `这次画面里的说明书文字还不够清楚${confidence}，我会继续尝试。`;
+          ? `已读取到 OCR 结果${confidence}，正在交给模型结合画面判断。`
+          : `OCR 结果不完整${confidence}，正在交给模型结合画面判断。`;
         appendMessage({ id: uid(), role: "system", text });
       }
       if (event.type === "ocr.retake.requested") {
@@ -865,7 +888,6 @@ export function App() {
         if (event.text?.trim() && (assistantTextFromTtsRef.current || !assistantTextRef.current.trim())) {
           updateAssistantDelta(event.text, "tts");
         }
-        if (!realtimeAudioRef.current || assistantTextFromTtsRef.current) enqueueSpeech(event.text);
       }
       if (event.type === "llm.done") {
         finishAssistant(event.cancelled);
@@ -889,7 +911,6 @@ export function App() {
       clearPendingSpeech,
       clearEmptyAssistantPlaceholder,
       currentSessionId,
-      enqueueSpeech,
       ensureAudioPlayer,
       finishAssistant,
       refreshConversationMeta,
@@ -1028,6 +1049,7 @@ export function App() {
       window.clearTimeout(pendingSpeechFrameTimerRef.current);
       window.clearTimeout(recognitionRestartTimerRef.current);
       window.clearTimeout(ttsReleaseTimerRef.current);
+      window.clearTimeout(medicationCaptureTimerRef.current);
     },
     [],
   );
@@ -1102,6 +1124,17 @@ export function App() {
     }
   }, [cameraStatus]);
 
+  useEffect(() => {
+    if (activeView !== "chat" || cameraStatus !== "active") return;
+    const video = videoRef.current;
+    const stream = cameraStreamRef.current;
+    if (!video || !stream) return;
+    if (video.srcObject !== stream) video.srcObject = stream;
+    if (video.paused || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      void video.play().catch(() => undefined);
+    }
+  }, [activeView, cameraStatus]);
+
   const toggleCamera = useCallback(async () => {
     if (cameraStatus === "requesting") return;
     if (cameraStatus === "active") {
@@ -1137,6 +1170,7 @@ export function App() {
       speechFrameCountRef.current = 0;
       lastSpeechFrameAtRef.current = 0;
       window.clearTimeout(pendingSpeechFrameTimerRef.current);
+      window.clearTimeout(medicationCaptureTimerRef.current);
       clearPendingSpeech();
       client.close();
 
@@ -1195,13 +1229,13 @@ export function App() {
       speechFrameCountRef.current = 0;
       lastSpeechFrameAtRef.current = 0;
       window.clearTimeout(pendingSpeechFrameTimerRef.current);
+      window.clearTimeout(medicationCaptureTimerRef.current);
       clearPendingSpeech();
       stopModelAudio();
       ttsQueueRef.current = [];
       ttsPlayingRef.current = false;
       ttsAsrSuppressedUntilRef.current = 0;
       window.clearTimeout(ttsReleaseTimerRef.current);
-      window.speechSynthesis?.cancel();
       window.clearTimeout(recognitionRestartTimerRef.current);
       recognitionDisabledRef.current = false;
       recognitionPausedForTtsRef.current = false;
@@ -1234,8 +1268,12 @@ export function App() {
     if (!text) return;
     setManualText("");
     clearPendingSpeech();
+    if (containsVisualIntent(text) && !containsMedicationInstructionIntent(text)) {
+      await sendRealtimeVisualPrompt(text);
+      return;
+    }
     await sendFinalTranscript(text);
-  }, [clearPendingSpeech, manualText, sendFinalTranscript]);
+  }, [clearPendingSpeech, manualText, sendFinalTranscript, sendRealtimeVisualPrompt]);
 
   const cancel = useCallback(() => {
     client.send("speech.cancel", { reason: "manual" });
@@ -1245,7 +1283,6 @@ export function App() {
     ttsPlayingRef.current = false;
     ttsAsrSuppressedUntilRef.current = 0;
     window.clearTimeout(ttsReleaseTimerRef.current);
-    window.speechSynthesis?.cancel();
     finishAssistant(true);
     setAiState(runningRef.current ? "listening" : "idle");
   }, [clearPendingSpeech, client, finishAssistant, stopModelAudio]);
@@ -1479,6 +1516,7 @@ export function App() {
                 partial={partial}
                 replayAssistantAudio={replayAssistantAudio}
                 setManualText={setManualText}
+                sendRealtimeVisualPrompt={sendRealtimeVisualPrompt}
                 sendManual={sendManual}
                 toggleCamera={toggleCamera}
                 toggleVoiceSession={toggleVoiceSession}
@@ -2037,6 +2075,7 @@ function ChatView(props: {
   partial: string;
   replayAssistantAudio: (message: ChatMessage) => boolean;
   setManualText: (text: string) => void;
+  sendRealtimeVisualPrompt: (text: string) => Promise<boolean>;
   sendManual: () => Promise<void>;
   toggleCamera: () => Promise<void>;
   toggleVoiceSession: () => Promise<void>;
@@ -2061,6 +2100,7 @@ function ChatView(props: {
     partial,
     replayAssistantAudio,
     setManualText,
+    sendRealtimeVisualPrompt,
     sendManual,
     toggleCamera,
     toggleVoiceSession,
@@ -2111,14 +2151,14 @@ function ChatView(props: {
       }
     >
       <div className="min-h-0 min-w-0 overflow-auto pr-1">
-        <div className="relative aspect-[4/3] overflow-hidden rounded-3xl border border-slate-200 bg-slate-900 shadow-soft">
-          <video ref={videoRef} playsInline muted className="h-full w-full object-cover" />
+        <div className="relative aspect-video overflow-hidden rounded-3xl border border-slate-200 bg-slate-900 shadow-soft">
+          <video ref={videoRef} playsInline muted className="h-full w-full object-contain" />
           <canvas ref={canvasRef} hidden />
           <canvas ref={sampleRef} hidden />
           <AiStatusIndicator state={aiState} />
           <CameraStatusDot status={cameraStatus} />
         </div>
-        <VisionQuickPrompts onSelectPrompt={setManualText} />
+        <VisionQuickPrompts onSelectPrompt={(prompt) => void sendRealtimeVisualPrompt(prompt)} />
       </div>
 
       <button
@@ -2201,15 +2241,7 @@ function MessageBubble({ message, onReplayAudio }: { message: ChatMessage; onRep
   }, [message.text]);
 
   const speakMessage = useCallback(() => {
-    if (onReplayAudio(message)) return;
-    const text = message.text.trim();
-    if (!text || !("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "zh-CN";
-    utterance.rate = 0.98;
-    utterance.pitch = 1;
-    window.speechSynthesis.speak(utterance);
+    onReplayAudio(message);
   }, [message, onReplayAudio]);
 
   const togglePositiveFeedback = useCallback(() => {
@@ -2247,7 +2279,7 @@ function MessageBubble({ message, onReplayAudio }: { message: ChatMessage; onRep
             <button
               className="grid h-8 w-8 place-items-center rounded-full transition hover:bg-slate-100 hover:text-slate-900"
               onClick={speakMessage}
-              title="朗读回复"
+              title="播放模型音频"
               type="button"
             >
               <Volume2 size={16} />

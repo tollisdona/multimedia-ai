@@ -95,6 +95,8 @@ class GatewayConnection:
                 await self.handle_final_transcript(text)
         elif message_type == "vision.frame":
             await self.handle_vision_frame(message)
+        elif message_type == "realtime.visual.prompt":
+            await self.handle_realtime_visual_prompt(message)
         elif message_type == "vision.capture.failed":
             await self.handle_vision_capture_failed(message)
         elif message_type == "vision.clear":
@@ -174,6 +176,57 @@ class GatewayConnection:
             reused=reused,
             bufferedFrames=len(self.session.recent_frames),
             realtimeDeferred=realtime_deferred,
+        )
+        await self.send_cost()
+
+    async def handle_realtime_visual_prompt(self, message: dict[str, Any]) -> None:
+        text = str(message.get("text", "")).strip()
+        data_url = str(message.get("image", ""))
+        reason = str(message.get("reason", "visual-prompt"))
+        if not text:
+            await self.send("error", code="invalid_visual_prompt", message="视觉提问需要文字。")
+            return
+        if not data_url.startswith("data:image/"):
+            await self.send("error", code="invalid_frame", message="视觉提问需要当前画面截图。")
+            return
+        if not self.realtime:
+            await self.send("error", code="realtime_required", message="请先配置并开启支持音频流的实时模型。")
+            return
+
+        await self.cancel_generation(silent=True)
+        self.session.latest_transcript = text
+        self.session.history.append({"role": "user", "content": text})
+        append_message(self.session.user_id, self.session.conversation_id, "user", text)
+        await self.send("asr.final", text=text)
+
+        image_hash = frame_hash(data_url)
+        reused = bool(self.session.recent_frames and self.session.recent_frames[-1].frame_hash == image_hash)
+        if reused:
+            self.session.cost.vision_cache_hits += 1
+        else:
+            self.session.recent_frames.append(
+                FrameSnapshot(data_url=data_url, reason=reason, frame_hash=image_hash, captured_at=now_ms())
+            )
+            self.session.recent_frames = self.session.recent_frames[-4:]
+
+        try:
+            created = await self.realtime.create_visual_prompt_response(text, data_url)
+        except Exception as exc:
+            await self.send("error", code="realtime_visual_prompt_failed", message=str(exc))
+            return
+        if not created:
+            await self.send("error", code="realtime_visual_prompt_failed", message="实时模型暂时无法接收当前画面。")
+            return
+
+        self.session.cost.vision_frames += 1
+        self.record_vlm_frame_usage(reason)
+        await self.send(
+            "vision.frame.cached",
+            reason=reason,
+            frameHash=image_hash,
+            reused=reused,
+            bufferedFrames=len(self.session.recent_frames),
+            realtimeDeferred=False,
         )
         await self.send_cost()
 

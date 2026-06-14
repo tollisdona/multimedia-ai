@@ -18,6 +18,7 @@ from .models import SessionState
 
 Emit = Callable[[str, Any], Awaitable[None]]
 TranscriptHook = Callable[[str], Awaitable[None]]
+SILENT_AUDIO_PREROLL_BASE64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 SUPPRESSED_REALTIME_ERROR_PATTERNS = (
     "none active response",
     "append image before append audio",
@@ -131,6 +132,49 @@ class QwenRealtimeProvider:
         )
         return True
 
+    async def commit_input_buffer(self) -> None:
+        await self.ensure_connected()
+        await self.send_raw(
+            {
+                "event_id": self.event_id(),
+                "type": "input_audio_buffer.commit",
+            }
+        )
+        self.audio_append_seen = False
+
+    async def ensure_audio_preroll(self) -> None:
+        if self.audio_append_seen:
+            return
+        await self.append_audio(SILENT_AUDIO_PREROLL_BASE64)
+
+    async def create_visual_prompt_response(self, text: str, data_url: str) -> bool:
+        clean = text.strip()
+        if not clean:
+            return False
+        await self.ensure_connected()
+        await self.ensure_audio_preroll()
+        appended = await self.append_image(data_url)
+        if not appended:
+            return False
+        await self.commit_input_buffer()
+        instructions = (
+            "用户通过界面选择了一个视觉快捷问题。请直接观察刚刚追加的摄像头画面回答，"
+            "不要说你没有收到图片；如果画面证据不足，请明确说明看不清或不确定。"
+            "用自然口语简洁回答，并输出音频。\n\n"
+            f"用户问题：{clean}"
+        )
+        await self.send_raw(
+            {
+                "event_id": self.event_id(),
+                "type": "response.create",
+                "response": {
+                    "modalities": ["text", "audio"],
+                    "instructions": instructions,
+                },
+            }
+        )
+        return True
+
     async def cancel(self) -> None:
         if not self.websocket or not self.connected:
             return
@@ -138,6 +182,7 @@ class QwenRealtimeProvider:
             await self.send_raw({"event_id": self.event_id(), "type": "response.cancel"})
         with suppress(Exception):
             await self.send_raw({"event_id": self.event_id(), "type": "input_audio_buffer.clear"})
+            self.audio_append_seen = False
 
     async def ensure_connected(self) -> None:
         if not self.websocket or not self.connected:

@@ -19,6 +19,7 @@ class MedicationOcrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.text, "")
         self.assertIsNotNone(result.confidence)
         self.assertNotIn("示例片", result.text)
+        self.assertEqual(result.image_data_url, frame.data_url)
 
     async def test_mock_result_fails_quality_gate_without_retry(self):
         frame = FrameSnapshot(

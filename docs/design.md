@@ -1,114 +1,220 @@
 # AI 视觉对话助手设计文档
 
-## 1. 用户故事
+## 1. 设计目标
+
+本项目目标是实现一个浏览器端多模态对话助手：用户可以打开摄像头与麦克风，让 AI 听到用户说话，并在用户明确需要视觉能力时理解当前画面，给出自然、低延迟、可朗读的回应。
+
+本轮设计结论是：**语音交互和视觉输入必须解耦**。VAD 负责判断用户是否在说话、是否需要打断、何时提交语音；VAD 不应默认等同于“需要发送摄像头画面”。视觉图片只应在用户明确触发视觉能力时发送，以降低误触发、成本和 Realtime 顺序错误。
+
+## 2. 用户故事
 
 计划实现：
 
-- 用户可以打开摄像头与麦克风，看到本地视频预览。
-- 用户说话时可以看到实时转写。
-- AI 可以流式生成文本，并尽快开始语音播报。
-- 用户问视觉问题时，系统能抓取当前关键帧并基于画面回答。
-- 用户插话时，系统取消当前回复与待播语音。
-- 评委可以看到音频时长、关键帧数量、缓存命中、估算 token、打断次数等成本指标。
+- 用户可以登录并管理历史会话。
+- 用户可以分别开启摄像头和麦克风。
+- 用户可以通过语音或文本与 AI 对话。
+- 用户可以看到实时转写、流式回复和语音播放状态。
+- 用户可以选择 Realtime 音色。
+- 用户可以在 AI 播报时插话，系统立即停止旧回复。
+- 用户明确需要视觉能力时，AI 能基于当前摄像头画面回答。
+- 用户可以用视觉快捷提问触发描述画面、识别文字、检查异常、解释变化。
+- 用户询问特定领域知识时，例如查看药品说明书，系统自动进入Agent流程，调用相关工具。
+- 用户可以查看模型消耗统计，包括音频、图片、token、TTS 和事件记录。
 
 当前实现：
 
-- 已实现摄像头/麦克风授权与预览。
-  - 已实现 WebSocket Gateway 长连接与流式事件协议。
-  - 已将对话编排抽象为 Pipecat-compatible conversation pipeline。
-- 已实现 AudioWorklet 音频分片上传，默认约 40ms 一帧。
-- 已实现浏览器 Web Speech API 低成本转写兜底，并通过 Gateway 回推 `asr.partial` / `asr.final`。
-- 已实现多模态/VL 模型 token 流式输出；未配置云模型时使用 mock streaming。
-- 已实现浏览器 SpeechSynthesis 分句 TTS，后端以 `tts.audio.chunk` 事件推送待播句子。
-- 已实现视觉关键帧上传、画面变化检测、关键帧缓存与 Omni/VL 直答适配。
-- 已实现成本面板与打断取消。
+- 已实现 React + FastAPI WebSocket Gateway 的实时会话。
+- 已实现摄像头预览和麦克风 AudioWorklet PCM 上传。
+- 已实现 Qwen Realtime 音频链路，并保留浏览器 Web Speech API ASR 兜底。
+- 已实现模型音频流播放、浏览器 TTS fallback、AI 回复复制/朗读/赞踩。
+- 已实现 ChatGPT 风格会话页面、历史会话管理、用户菜单、API Key 管理和模型消耗统计页。
+- 已实现 SQLite 用户、会话、消息、模型配置、成本快照和 usage events 持久化。
+- 已实现 Qwen Realtime image append guard：云端 Realtime session 没有成功 append audio 前，不向其 append image。
+- 已实现药品说明书 Agent：保守意图识别、后端请求截图、OCR、质量门、安全回答和短期追问上下文。
 
-## 2. 混合流式架构
+## 3. 交互策略
 
-系统采用混合流式，而非全量连续视频上传：
+### 3.1 摄像头与麦克风
 
-- 麦克风音频：全流式上传到 Gateway，用于 VAD、成本统计和未来服务端 ASR。
-- ASR：默认使用浏览器 Web Speech API 低成本兜底，结果仍通过 Gateway 标准化回推。
-- 模型回答：后端通过 conversation pipeline 使用 OpenAI-compatible Omni/VL streaming 接口；无 Key 时使用 mock stream。
-- TTS：conversation pipeline 按短句发送 `tts.audio.chunk`，首版使用浏览器 SpeechSynthesis 播放。
-- 视频：只上传关键帧，触发条件包括视觉关键词、画面变化、时间间隔。
+- 摄像头按钮只负责授权、开启预览和关闭摄像头。
+- 麦克风按钮负责开启实时语音会话、上传音频、触发 VAD、接收 ASR 和打断逻辑。
+- 摄像头开启不代表每轮消息都要带图片。
+- 麦克风检测到用户开口不代表需要抓图。
+
+### 3.2 什么时候发送图片
+
+默认策略：
+
+- 普通文本消息：不发送图片。
+- 普通语音消息：不因 VAD `speechStart` 自动发送图片。
+- 用户明确选择视觉能力时，才抓取当前帧。
+
+推荐保留的图片发送时机：
+
+- 用户点击视觉快捷提问，例如“描述画面”“识别文字”“检查异常”“解释变化”。
+- 用户点击显式的“带画面发送 / 抓取当前画面”控件。
+- 后端 Agent 发出 `vision.capture.request`，例如药品说明书 OCR。
+
+不推荐作为默认触发：
+
+- 命中宽泛关键词，例如“看”“这个”“那个”“前面”。
+- VAD 检测到用户刚开始说话。
+- 仅仅因为摄像头处于开启状态。
+
+### 3.3 Realtime 顺序约束
+
+Qwen Realtime 对事件顺序敏感。如果云端 session 还没有收到 `input_audio_buffer.append`，就先收到 `input_image_buffer.append`，会报：
+
+```text
+Error append image before append audio
+```
+
+因此后端必须维护当前 Realtime provider 的 `audio_append_seen` 状态：
+
+- `append_audio()` 成功发送后置为 true。
+- 新连接、关闭、重连、取消后需要重新评估。
+- `append_image()` 在 `audio_append_seen=false` 时返回 false，不直接向云端发送。
+- Agent/OCR 图片默认带 `realtimeEligible:false`，只进入 OCR/工具链，不进入 Realtime image buffer。
+
+## 4. 系统架构
 
 ```mermaid
 flowchart LR
-  Browser["Browser: camera, mic, ASR fallback, TTS playback"]
+  UI["React UI: chat, camera, mic, history, settings"]
+  Audio["AudioWorklet PCM + VAD"]
   Gateway["FastAPI WebSocket Gateway"]
-  ASR["ASR slot: browser fallback / FunASR later"]
-  Vision["Frame buffer: keyframes in memory"]
-  Model["Direct answer model: Qwen-Omni / Qwen-VL / mock"]
-  Cost["Cost Controller"]
+  Realtime["Qwen Realtime: audio ASR / model audio"]
+  Pipeline["ConversationPipeline"]
+  Direct["Direct multimodal chat completions"]
+  Agent["MedicationInstructionAgent"]
+  OCR["Qwen-VL document OCR"]
+  DB["SQLite: users, sessions, messages, usage"]
 
-  Browser <--> Gateway
-  Gateway --> ASR
-  Gateway --> Vision
-  Gateway --> Pipe["Pipecat-compatible Conversation Pipeline"]
-  Pipe --> Model
-  Gateway --> Cost
-  Gateway --> Browser
+  UI --> Audio
+  UI <--> Gateway
+  Gateway <--> Realtime
+  Gateway --> Pipeline
+  Pipeline --> Direct
+  Pipeline --> Agent
+  Agent --> OCR
+  Gateway --> DB
+  Pipeline --> DB
 ```
 
-## 3. 成本控制技巧
+主要模块：
 
-想到的技巧：
+- `frontend/src/App.tsx`：主页面、会话 UI、摄像头/麦克风控制、视觉快捷提问、模型消耗统计。
+- `frontend/src/lib/audioCapture.ts`：AudioWorklet PCM 采集与 VAD 快照回调。
+- `frontend/src/lib/pcmPlayer.ts`：Realtime PCM 音频流播放。
+- `backend/app/gateway.py`：WebSocket Gateway、会话生命周期、音频转发、关键帧缓存、Realtime guard、Agent 截图请求。
+- `backend/app/realtime.py`：Qwen Realtime provider。
+- `backend/app/conversation_pipeline.py`：普通对话与 Agent 路由。
+- `backend/app/medication_agent.py`：药品说明书 OCR Agent。
+- `backend/app/medication_ocr.py`：文档式 OCR provider。
+- `backend/app/db.py`：SQLite 持久化和 usage events。
 
-- 不上传连续视频，只上传关键帧。
-- 静音或低能量音频不触发推理。
-- 画面相似时复用上一关键帧缓存，避免重复图片推理。
-- 视觉关键词触发高优先级关键帧。
-- 用户打断后立即取消模型生成与 TTS。
-- 对话历史只保留短窗口，关键帧只保留最近几张且不落盘。
-- ASR/TTS 优先用浏览器能力或本地服务，降低云调用成本。
-- 云模型统一通过可替换适配层，便于替换低价模型。
+## 5. 成本控制策略
+
+想到的策略：
+
+- 不连续上传视频。
+- 图片只在明确视觉动作或 Agent 请求时上传。
+- VAD 只控制语音生命周期，不自动触发图片。
+- 降低视觉关键词误触发，避免“看/这个/那个”这类口语词导致无效图片调用。
+- Realtime 图片 append 必须等待音频 append，避免 provider 错误和无效重试。
+- 使用浏览器 ASR/TTS 作为低成本兜底。
+- 使用关键帧 hash 去重和短窗口缓存。
+- 对 OCR/Agent 结果做短期缓存，支持有限追问。
+- 对 OCR 重拍次数设置上限。
+- 不落盘原始音频、视频、图片。
+- 记录 usage events 以便复盘和估算运营成本。
 
 实际采用：
 
-- AudioWorklet 上传音频帧，同时统计有效语音时长。
-- 前端画面变化检测，静止画面 10-15 秒最多分析一次。
-- 关键帧缓存和缓存命中统计。
-- 多模态/VL 模型流式输出按句切分，TTS 只播已生成短句。
-- `speech.cancel` 会取消当前后端生成任务和浏览器 TTS 队列。
-- 成本面板展示视觉帧、缓存、语音秒数、估算 token、TTS 字符数、打断次数。
+- 前端和后端均不上传连续视频流。
+- 后端维护最近 10 秒、最多 4 张关键帧缓存。
+- 后端使用 frame hash 统计缓存命中。
+- Realtime provider 实现 `audio_append_seen` guard。
+- 药品 OCR 图片使用 `realtimeEligible:false`，绕开 Realtime image buffer。
+- SQLite 记录消息、成本快照和 usage events。
+- 模型消耗统计页展示 token、音频、图片、TTS、事件和会话聚合。
+- 用户打断会取消当前生成和播放。
 
-## 4. 高并发网关考虑
+仍需收敛：
 
-当前代码是单机可演示实现，但接口按生产网关方式设计：
+- 关闭或默认禁用 VAD speechStart 自动抓图。
+- 关闭宽泛视觉关键词自动抓图，改为显式视觉按钮或更严格的意图规则。
+- 后端 direct model 不应仅因为 `recent_frames` 非空就默认带图；应由本轮请求的视觉标记决定。
+- 普通文本视觉问题和 Realtime 音频会话之间需要更明确的路由：文本视觉可走 Chat Completions/VLM，Realtime image buffer 只服务实时音频视觉场景。
 
-- WebSocket 连接以 session 为单位。
-- Gateway 不存放长期用户数据。
-- 模型服务通过适配层隔离，未来可拆为独立 ASR/VL/Omni/TTS 服务。
-- 对话服务通过 `ConversationPipeline` 隔离，未来可替换为 Pipecat native processors。
-- 成本与限流状态集中在 session cost state；生产可迁移到 Redis。
-- GPU 推理服务可独立扩容，不让 Gateway 处理重计算。
+## 6. 药品说明书 Agent
 
-生产化升级：
+药品说明书属于高风险场景，不能让普通视觉问答自由猜测药名、剂量或禁忌。
 
-- 使用 Redis 存储 session、限流计数、关键帧缓存元数据。
-- 使用队列隔离视觉和 TTS 慢任务。
-- Gateway 前置 Nginx/Cloudflare/API Gateway。
-- 服务端 ASR 替换浏览器 ASR 兜底，保持事件协议不变。
+触发示例：
 
-## 5. 模型默认选型
+- `这个药怎么吃`
+- `帮我看药品说明书`
+- `药盒上的用法用量是什么`
+- `识别这个说明书`
 
-普通笔记本 + 云 API 推荐：
+非触发示例：
 
-- ASR：浏览器 Web Speech API 兜底；后续接 FunASR/SenseVoice streaming。
-- 视觉/对话直答：优先 Qwen-Omni Chat Completions；也可只配置 Qwen-VL / MiniCPM-V / InternVL 这类 VL 模型直接回答；无 Key 时 mock。
-- TTS：浏览器 SpeechSynthesis；后续接 CosyVoice/GPT-SoVITS chunk。
+- `帮我看看这个`
+- `识别文字`
+- `看一下说明`
 
-该设计避免依赖 OpenAI Realtime 或一体化视频对话 API，重点展示实时协议、模型编排和成本控制。
+流程：
 
-## 6. Pipecat 改造说明
+1. `ConversationPipeline` 先做药品意图检测。
+2. 命中后进入 `MedicationInstructionAgent`。
+3. Agent 发送 `scene.switched` 和 `agent.guidance`。
+4. Agent 通过 `vision.capture.request` 请求前端高质量截图。
+5. 前端回传 `vision.frame`，并标记 `realtimeEligible:false`。
+6. OCR provider 提取说明书文字。
+7. 质量门检查 OCR 是否有足够药品和用法信息。
+8. 回答模型只能基于 OCR 文本生成。
+9. 追问上下文保留 3 分钟或 3 轮。
 
-本次改造采用 Pipecat-compatible pipeline 层，而不是继续把所有逻辑堆在 Gateway 中：
+安全约束：
 
-- `gateway-service`：只负责 WebSocket transport、事件路由、会话生命周期。
-- `conversation-pipeline`：负责多模态/VL 流式输出、TTS 分句、历史记录、成本快照、取消边界。
-- `vision-service`：只负责关键帧缓存与去重，不再生成视觉摘要。
+- 不使用假 OCR 文本。
+- OCR 不可用时安全失败。
+- OCR 不清晰时请求重拍或退出。
+- 不补全缺失药名、剂量、频次、禁忌。
+- 老人、儿童、孕妇、慢病、过敏、联合用药场景提示咨询医生或药师。
 
-当前本机 Python 为 3.9，Pipecat 原生模块使用 Python 3.10+ 类型语法，因此运行时会报告
-`pipeline.mode=pipecat-compatible-adapter`。在 Python 3.10+ 环境中可进一步将该 pipeline
-替换为 Pipecat native `Pipeline/Task/Transport`，前端协议无需变化。
+## 7. 模型选型
+
+默认供应商为 DashScope/Qwen：
+
+- Realtime：Qwen Realtime，用于实时音频输入和模型音频输出。
+- 普通多模态问答：OpenAI-compatible Chat Completions，支持 Qwen Omni/VL 模型。
+- 药品 OCR：Qwen-VL 文档式 OCR provider。
+- 本地兜底：浏览器 Web Speech API 和 SpeechSynthesis。
+
+配置优先级：
+
+1. 登录用户保存的模型配置。
+2. 后端环境变量。
+3. 无 Key 时 mock/safe fallback。
+
+## 8. 测试与演示要求
+
+基础验证：
+
+- 后端 `compileall` 或单元测试通过。
+- 前端 `npm run build` 通过。
+- 未配置云端 Key 时仍能登录、进入会话、使用 mock/fallback 演示。
+- 配置 Realtime Key 时，音频输入、音频输出、打断、音色选择可工作。
+- 视觉图片不应在普通语音开口时自动发送。
+- 视觉快捷提问和药品 Agent 请求可以触发图片。
+- Realtime session 未收到音频时，图片 append 不应产生用户可见 provider 错误。
+
+演示重点：
+
+- ChatGPT 风格历史会话和对话体验。
+- 麦克风实时语音、模型音频流、打断。
+- 显式视觉提问而非连续视频上传。
+- 药品说明书 OCR Agent 的安全失败和安全回答。
+- 模型消耗统计和最近事件分页。

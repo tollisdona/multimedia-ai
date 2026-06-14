@@ -15,10 +15,8 @@ from .models import FrameSnapshot, now_ms
 
 
 CAPTURE_INSTRUCTION = "请把药品说明书、药盒或药瓶标签对准镜头，尽量让药名和用法用量清晰可见。"
-RETAKE_INSTRUCTION = "我会再等一下，请把药名、用法用量或注意事项区域放到画面中央，尽量避免反光。"
 FOLLOWUP_MS = 3 * 60 * 1000
 FOLLOWUP_TURNS = 3
-MAX_RETAKES = 2
 FRAME_WAIT_SECONDS = 12.0
 
 
@@ -59,53 +57,37 @@ class MedicationInstructionAgent:
 
         frame: FrameSnapshot | None = None
         ocr_result: MedicationOcrResult | None = None
-        for attempt in range(MAX_RETAKES + 1):
-            self.session.agent_state = "medication.awaiting_frame"
-            instruction = CAPTURE_INSTRUCTION if attempt == 0 else RETAKE_INSTRUCTION
-            yield PipelineEvent(
-                "agent.guidance",
-                {"agent": self.name, "text": instruction, "speak": True, "attempt": attempt + 1, "maxAttempts": MAX_RETAKES + 1},
-            )
-            frame = await self.request_frame(instruction)
-            if frame is None:
-                async for event in self.emit_answer("没有获得清晰画面，我先退出药品说明书识别。你可以打开摄像头后再说“帮我看药品说明书”。"):
-                    yield event
-                yield self.exit_event("capture_unavailable")
-                return
-
-            self.session.agent_state = "medication.ocr_running"
-            yield PipelineEvent("ocr.started", {"requestId": frame.frame_hash})
-            ocr_result = await self.context.ocr_provider.recognize(frame)
-            quality = medication_quality(ocr_result)
-            yield PipelineEvent(
-                "ocr.result",
-                {
-                    "textPreview": ocr_result.text_preview(),
-                    "confidence": ocr_result.confidence,
-                    "accepted": quality.accepted,
-                    "provider": ocr_result.provider,
-                },
-            )
-            if quality.accepted:
-                if quality.missing:
-                    ocr_result.uncertain_parts = [*ocr_result.uncertain_parts, *quality.missing]
-                break
-            if quality.retryable and attempt < MAX_RETAKES:
-                yield PipelineEvent(
-                    "ocr.retake.requested",
-                    {
-                        "requestId": frame.frame_hash,
-                        "reason": quality.reason,
-                        "instruction": RETAKE_INSTRUCTION,
-                        "attempt": attempt + 2,
-                        "maxAttempts": MAX_RETAKES + 1,
-                    },
-                )
-                continue
-            async for event in self.emit_answer(f"{quality.reason} 我先退出药品说明书识别，请换个光线或手动输入关键文字后再问。"):
+        yield PipelineEvent(
+            "agent.guidance",
+            {"agent": self.name, "text": CAPTURE_INSTRUCTION, "speak": False, "attempt": 1, "maxAttempts": 1},
+        )
+        self.session.agent_state = "medication.awaiting_frame"
+        frame = await self.request_frame(CAPTURE_INSTRUCTION)
+        if frame is None:
+            async for event in self.emit_answer("没有获得清晰画面，我先退出药品说明书识别。你可以打开摄像头后再说“帮我看药品说明书”。"):
                 yield event
-            yield self.exit_event("ocr_quality_low")
+            yield self.exit_event("capture_unavailable")
             return
+
+        self.session.agent_state = "medication.ocr_running"
+        yield PipelineEvent("ocr.started", {"requestId": frame.frame_hash})
+        ocr_result = await self.context.ocr_provider.recognize(frame)
+        quality = medication_quality(ocr_result)
+        if quality.missing:
+            ocr_result.uncertain_parts = [*ocr_result.uncertain_parts, *quality.missing]
+        if not quality.accepted and quality.reason:
+            ocr_result.uncertain_parts = [*ocr_result.uncertain_parts, quality.reason]
+        yield PipelineEvent(
+            "ocr.result",
+            {
+                "textPreview": ocr_result.text_preview(),
+                "confidence": ocr_result.confidence,
+                "accepted": quality.accepted,
+                "retryable": False,
+                "reason": quality.reason,
+                "provider": ocr_result.provider,
+            },
+        )
 
         if ocr_result is None:
             yield self.exit_event("ocr_missing")
@@ -142,6 +124,7 @@ class MedicationInstructionAgent:
             image_hash=str(raw.get("image_hash", "")),
             captured_at=int(raw.get("captured_at", now_ms()) or now_ms()),
             uncertain_parts=raw.get("uncertain_parts") if isinstance(raw.get("uncertain_parts"), list) else [],
+            image_data_url=str(raw.get("image_data_url", "")),
         )
 
     def is_followup_active(self, now: int) -> bool:
@@ -204,17 +187,23 @@ class MedicationInstructionAgent:
                 yield text[i : i + 10]
             return
 
-        api_key, base_url, model, _supports_modalities = config
-        payload = {
+        api_key, base_url, model, supports_modalities = config
+        include_image = bool(ocr_result.image_data_url)
+        payload: dict[str, Any] = {
             "model": model,
             "messages": [
-                {"role": "system", "content": "你是药品说明书阅读助手。只能根据用户提供的 OCR 文本回答，不要凭空补全。"},
-                {"role": "user", "content": prompt},
+                {
+                    "role": "system",
+                    "content": "你是药品说明书阅读助手。只能根据 OCR 文本和原图中明确可见的信息回答，不要凭空补全。",
+                },
+                {"role": "user", "content": self.build_answer_user_content(prompt, ocr_result)},
             ],
             "stream": True,
             "stream_options": {"include_usage": True},
             "temperature": 0.2,
         }
+        if supports_modalities:
+            payload["modalities"] = ["text"]
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         prompt_tokens = 0
         completion_tokens = 0
@@ -253,6 +242,7 @@ class MedicationInstructionAgent:
             completion_tokens=completion_tokens,
             estimated_prompt_tokens=0 if prompt_tokens else estimate_tokens(prompt),
             estimated_completion_tokens=0 if completion_tokens else estimated_output_tokens,
+            image_count=1 if include_image and ocr_result.image_data_url else 0,
             details={"agent": self.name, "ocr_provider": ocr_result.provider},
         )
 
@@ -261,15 +251,26 @@ class MedicationInstructionAgent:
         uncertain = "；".join(ocr_result.uncertain_parts) if ocr_result.uncertain_parts else "无"
         return (
             "用户正在让你阅读药品说明书。你不是医生，不能给出超出说明书的医疗建议。\n"
-            "必须只根据 OCR 文本回答；如果药名、剂量、频次、禁忌不清楚，明确说无法确认。\n"
+            "必须只根据 OCR 文本和随附原图中明确可见的信息回答；如果 OCR 与原图不一致，优先说明不确定。\n"
+            "如果药名、剂量、频次、禁忌不清楚，明确说无法确认。\n"
+            "即使 OCR 失败或 OCR 文本为空，也要先观察随附原图；如果原图仍看不清，请由你自然提示用户重新把药盒、药瓶标签或说明书对准镜头再试，不要说系统流程已结束。\n"
             "涉及老人、儿童、孕妇、慢病、过敏或联合用药时，提醒咨询医生或药师。\n\n"
             f"用户问题：{user_text}\n"
             f"OCR 提供方：{ocr_result.provider}\n"
             f"OCR 不确定项：{uncertain}\n"
-            f"OCR 文本：\n{ocr_result.text}\n\n"
+            f"OCR 文本：\n{ocr_result.text or '（OCR 未识别到可用文字，请结合随附原图判断是否需要用户重试。）'}\n\n"
             "请按以下格式简洁回答：\n"
             "我识别到的关键信息：\n用法用量：\n注意事项：\n我不确定的地方：\n建议："
         )
+
+    @staticmethod
+    def build_answer_user_content(prompt: str, ocr_result: MedicationOcrResult) -> str | list[dict[str, Any]]:
+        if not ocr_result.image_data_url:
+            return prompt
+        return [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": ocr_result.image_data_url, "detail": "high"}},
+        ]
 
     @staticmethod
     def local_answer(user_text: str, ocr_result: MedicationOcrResult) -> str:

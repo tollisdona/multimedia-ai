@@ -86,6 +86,30 @@ class RealtimeGuardTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(emitted, [])
 
+    async def test_visual_prompt_creates_audio_response_after_image_append(self):
+        provider = QwenRealtimeProvider(SessionState(), noop_emit, noop_transcript, noop_transcript, config())
+        sent_payloads = []
+
+        async def fake_ensure_connected():
+            return None
+
+        async def collect_send_raw(payload):
+            sent_payloads.append(payload)
+
+        provider.ensure_connected = fake_ensure_connected
+        provider.send_raw = collect_send_raw
+
+        created = await provider.create_visual_prompt_response("请描述画面", "data:image/jpeg;base64,abc")
+
+        self.assertTrue(created)
+        self.assertEqual(sent_payloads[0]["type"], "input_audio_buffer.append")
+        self.assertEqual(sent_payloads[1]["type"], "input_image_buffer.append")
+        self.assertEqual(sent_payloads[2]["type"], "input_audio_buffer.commit")
+        self.assertEqual(sent_payloads[3]["type"], "response.create")
+        self.assertEqual(sent_payloads[3]["response"]["modalities"], ["text", "audio"])
+        self.assertIn("请描述画面", sent_payloads[3]["response"]["instructions"])
+        self.assertFalse(provider.audio_append_seen)
+
 
 if __name__ == "__main__":
     unittest.main()

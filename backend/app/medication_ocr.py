@@ -38,6 +38,7 @@ class UnavailableOcrProvider:
             image_hash=frame.frame_hash,
             captured_at=frame.captured_at,
             uncertain_parts=[self.reason],
+            image_data_url=frame.data_url,
         )
 
 
@@ -124,6 +125,7 @@ class QwenVlDocumentOcrProvider:
             image_hash=frame.frame_hash,
             captured_at=frame.captured_at,
             uncertain_parts=uncertain_parts,
+            image_data_url=frame.data_url,
         )
 
     @staticmethod

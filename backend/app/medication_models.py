@@ -13,6 +13,7 @@ class MedicationOcrResult:
     image_hash: str
     captured_at: int
     uncertain_parts: list[str] = field(default_factory=list)
+    image_data_url: str = ""
 
     def text_preview(self, limit: int = 160) -> str:
         clean = " ".join(self.text.split())
@@ -65,4 +66,5 @@ def result_to_agent_context(result: MedicationOcrResult) -> dict[str, Any]:
         "captured_at": result.captured_at,
         "uncertain_parts": result.uncertain_parts,
         "blocks": result.blocks,
+        "image_data_url": result.image_data_url,
     }

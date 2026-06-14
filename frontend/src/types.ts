@@ -50,7 +50,15 @@ export type GatewayEvent =
       instruction: string;
     }
   | { type: "ocr.started"; requestId: string }
-  | { type: "ocr.result"; textPreview: string; confidence: number | null; accepted: boolean; provider: string }
+  | {
+      type: "ocr.result";
+      textPreview: string;
+      confidence: number | null;
+      accepted: boolean;
+      provider: string;
+      retryable?: boolean;
+      reason?: string;
+    }
   | { type: "ocr.retake.requested"; requestId: string; reason: string; instruction: string; attempt?: number; maxAttempts?: number }
   | { type: "agent.exited"; agent: string; reason: string }
   | { type: "llm.delta"; delta: string }
