@@ -11,6 +11,7 @@ import websockets
 from websockets.client import WebSocketClientProtocol
 
 from .ai import direct_model_system_prompt, estimate_tokens, strip_data_url
+from .db import enqueue_usage_event
 from .model_config import RuntimeModelConfig, env_model_config
 from .models import SessionState
 
@@ -204,6 +205,16 @@ class QwenRealtimeProvider:
             transcript = str(payload.get("transcript", "")).strip()
             if transcript:
                 self.assistant_buffer = transcript
+                self.session.cost.tts_chars += len(transcript)
+                enqueue_usage_event(
+                    self.session.user_id,
+                    self.session.conversation_id,
+                    provider="qwen-realtime",
+                    model=self.model_config.realtime_model,
+                    modality="tts",
+                    metric_type="text_characters",
+                    tts_chars=len(transcript),
+                )
                 await self.on_assistant_transcript(transcript)
                 self.assistant_saved = True
                 self.assistant_buffer = ""
@@ -229,8 +240,21 @@ class QwenRealtimeProvider:
             self.assistant_buffer = ""
             usage = payload.get("response", {}).get("usage", {}) if isinstance(payload.get("response"), dict) else {}
             if isinstance(usage, dict):
-                self.session.cost.llm_input_tokens_est += int(usage.get("input_tokens", 0) or 0)
-                self.session.cost.llm_output_tokens_est += int(usage.get("output_tokens", 0) or 0)
+                input_tokens = int(usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0) or 0)
+                output_tokens = int(usage.get("output_tokens", 0) or usage.get("completion_tokens", 0) or 0)
+                self.session.cost.llm_input_tokens += input_tokens
+                self.session.cost.llm_output_tokens += output_tokens
+                enqueue_usage_event(
+                    self.session.user_id,
+                    self.session.conversation_id,
+                    provider="qwen-realtime",
+                    model=self.model_config.realtime_model,
+                    modality="vlm",
+                    metric_type="provider_usage",
+                    prompt_tokens=input_tokens,
+                    completion_tokens=output_tokens,
+                    details={"usage": usage},
+                )
             await self.emit("llm.done", {"cancelled": False})
             return
 

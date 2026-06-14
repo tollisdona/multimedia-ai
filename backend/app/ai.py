@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from .config import settings
+from .db import enqueue_usage_event
 from .model_config import env_model_config
 from .models import SessionState
 
@@ -20,6 +21,17 @@ SENTENCE_RE = re.compile(r"(.+?[。！？!?；;])")
 
 def estimate_tokens(text: str) -> int:
     return max(1, int(len(text) / 1.6))
+
+
+def extract_stream_usage(payload: dict[str, Any]) -> tuple[int, int] | None:
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    if prompt_tokens <= 0 and completion_tokens <= 0:
+        return None
+    return prompt_tokens, completion_tokens
 
 
 def frame_hash(data_url: str) -> str:
@@ -88,7 +100,9 @@ async def stream_direct_model(session: SessionState, user_text: str) -> AsyncIte
         item["content"] if isinstance(item.get("content"), str) else json.dumps(item.get("content"), ensure_ascii=False)
         for item in messages
     )
-    session.cost.llm_input_tokens_est += estimate_tokens(text_for_estimate)
+    estimated_input_tokens = estimate_tokens(text_for_estimate)
+    estimated_output_tokens = 0
+    session.cost.llm_input_tokens_est += estimated_input_tokens
 
     model_config = direct_model_config(session)
     if model_config is None:
@@ -104,13 +118,15 @@ async def stream_direct_model(session: SessionState, user_text: str) -> AsyncIte
         return
 
     api_key, base_url, model, supports_modalities = model_config
-    if session.recent_frames:
+    image_count = 1 if session.recent_frames else 0
+    if image_count:
         session.cost.vision_frames += 1
 
     payload = {
         "model": model,
         "messages": messages,
         "stream": True,
+        "stream_options": {"include_usage": True},
         "temperature": 0.35,
     }
     if supports_modalities:
@@ -119,6 +135,8 @@ async def stream_direct_model(session: SessionState, user_text: str) -> AsyncIte
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    prompt_tokens = 0
+    completion_tokens = 0
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream(
             "POST", f"{base_url}/chat/completions", headers=headers, json=payload
@@ -131,12 +149,34 @@ async def stream_direct_model(session: SessionState, user_text: str) -> AsyncIte
                 if raw == "[DONE]":
                     break
                 try:
-                    choice = json.loads(raw)["choices"][0]
+                    chunk = json.loads(raw)
+                    usage = extract_stream_usage(chunk)
+                    if usage:
+                        prompt_tokens, completion_tokens = usage
+                    choice = chunk["choices"][0]
                     delta = choice.get("delta", {}).get("content", "")
                 except (KeyError, json.JSONDecodeError, IndexError, TypeError):
                     continue
                 if isinstance(delta, str) and delta:
+                    estimated_output_tokens += estimate_tokens(delta)
                     yield delta
+    if prompt_tokens > 0 or completion_tokens > 0:
+        session.cost.llm_input_tokens += prompt_tokens
+        session.cost.llm_output_tokens += completion_tokens
+    enqueue_usage_event(
+        session.user_id,
+        session.conversation_id,
+        provider=base_url,
+        model=model,
+        modality="vlm" if image_count else "llm",
+        metric_type="provider_usage" if prompt_tokens or completion_tokens else "estimated_tokens",
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        estimated_prompt_tokens=estimated_input_tokens if prompt_tokens == 0 else 0,
+        estimated_completion_tokens=estimated_output_tokens if completion_tokens == 0 else 0,
+        image_count=image_count,
+        details={"supports_modalities": supports_modalities, "usage_source": "stream_options.include_usage"},
+    )
 
 
 def sentence_chunks(buffer: str) -> tuple[list[str], str]:

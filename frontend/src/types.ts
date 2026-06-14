@@ -13,9 +13,12 @@ export interface CostSnapshot {
   audioChunks: number;
   visionFrames: number;
   visionCacheHits: number;
+  llmInputTokens?: number;
+  llmOutputTokens?: number;
   llmInputTokensEst: number;
   llmOutputTokensEst: number;
   ttsChars: number;
+  ttsAudioSeconds?: number;
   interruptions: number;
   estimatedUnits: number;
 }

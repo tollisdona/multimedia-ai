@@ -50,6 +50,48 @@ export interface ModelConfigUpdate {
   realtimeVoice: string;
 }
 
+export interface UsageTotals {
+  eventCount: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  estimatedPromptTokens: number;
+  estimatedCompletionTokens: number;
+  audioMs: number;
+  speechMs: number;
+  audioChunks: number;
+  ttsChars: number;
+  ttsAudioMs: number;
+  imageCount: number;
+  estimatedUnits: number;
+}
+
+export interface UsageBucket extends UsageTotals {
+  id?: string;
+  title?: string;
+  modality?: string;
+  lastUsedAt?: number;
+}
+
+export interface UsageEvent extends UsageTotals {
+  provider: string;
+  model: string;
+  modality: string;
+  metricType: string;
+  createdAt: number;
+}
+
+export interface UsageStats {
+  periodStart: number;
+  periodEnd: number;
+  generatedAt: number;
+  days: number;
+  totals: UsageTotals;
+  modalities: UsageBucket[];
+  conversations: UsageBucket[];
+  recentEvents: UsageEvent[];
+}
+
 const AUTH_STORAGE_KEY = "ai-vision-auth";
 
 async function requestJson<T>(baseUrl: string, path: string, options: RequestInit = {}, token?: string) {
@@ -165,4 +207,8 @@ export async function updateModelConfig(baseUrl: string, token: string, payload:
     },
     token,
   );
+}
+
+export async function fetchUsageStats(baseUrl: string, token: string, days = 7) {
+  return requestJson<UsageStats>(baseUrl, `/api/usage/stats?days=${days}`, {}, token);
 }
