@@ -1,28 +1,34 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  Activity,
   ArrowUp,
   BarChart3,
   Camera,
   Check,
-  CircleStop,
+  Copy,
+  Database,
   Eye,
+  FileText,
+  Gauge,
   History,
   KeyRound,
+  LogOut,
   MessageSquare,
   Mic,
+  MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
-  Play,
   Radio,
-  RefreshCw,
-  Settings,
-  Shield,
+  SlidersHorizontal,
   Square,
   Pencil,
+  RefreshCw,
+  ThumbsDown,
+  ThumbsUp,
+  Timer,
   Trash2,
   Volume2,
-  Wifi,
   WifiOff,
   X,
 } from "lucide-react";
@@ -57,10 +63,12 @@ import { GatewayClient } from "./lib/wsClient";
 import type { ChatMessage, CostSnapshot, GatewayEvent, VadSnapshot } from "./types";
 
 const visualKeywords = ["看", "看到", "这个", "那个", "画面", "颜色", "桌", "手里", "旁边", "前面", "物体", "摄像头"];
-const SPEECH_AUTO_SEND_DELAY_MS = 1200;
+const SPEECH_AUTO_SEND_DELAY_MS = 2600;
+const SPEECH_FINAL_SETTLE_DELAY_MS = 1800;
 const DUPLICATE_SPEECH_WINDOW_MS = 1800;
 const NEW_SESSION_BUSY_ID = "__new_session__";
 const BLUR_THRESHOLD = 80;
+const MAX_REALTIME_IMAGE_BASE64_BYTES = 240 * 1024;
 const VOICE_STORAGE_KEY = "ai-vision-realtime-voice";
 const realtimeVoices = ["Cherry", "Serena", "Ethan", "Chelsie"] as const;
 type RealtimeVoice = (typeof realtimeVoices)[number];
@@ -71,16 +79,20 @@ const emptyCost: CostSnapshot = {
   audioChunks: 0,
   visionFrames: 0,
   visionCacheHits: 0,
+  llmInputTokens: 0,
+  llmOutputTokens: 0,
   llmInputTokensEst: 0,
   llmOutputTokensEst: 0,
   ttsChars: 0,
+  ttsAudioSeconds: 0,
   interruptions: 0,
   estimatedUnits: 0,
 };
 
-type AppView = "chat" | "cost" | "settings" | "apiKeys";
+type AppView = "chat" | "settings" | "apiKeys" | "usage";
 type AiState = "idle" | "listening" | "processing" | "speaking";
 type MediaAction = "start" | "stop" | null;
+type DeviceStatus = "idle" | "requesting" | "active" | "blocked" | "error";
 type SessionMeta = {
   id: string;
   title: string;
@@ -112,6 +124,23 @@ function createStarterMessages(): ChatMessage[] {
 function loadStoredVoice(): RealtimeVoice {
   const stored = localStorage.getItem(VOICE_STORAGE_KEY);
   return realtimeVoices.includes(stored as RealtimeVoice) ? (stored as RealtimeVoice) : "Cherry";
+}
+
+function imagePayloadSize(dataUrl: string) {
+  return dataUrl.slice(dataUrl.indexOf(",") + 1).length;
+}
+
+function mediaErrorMessage(deviceName: "摄像头" | "麦克风", error: unknown) {
+  if (error instanceof DOMException) {
+    if (error.name === "NotAllowedError") return `${deviceName}权限被拒绝，请在浏览器地址栏权限设置中允许后重试。`;
+    if (error.name === "NotFoundError") return `没有检测到可用的${deviceName}设备。`;
+    if (error.name === "NotReadableError") return `${deviceName}被其他应用占用，请关闭占用后重试。`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function mediaStatusFromError(error: unknown): DeviceStatus {
+  return error instanceof DOMException && error.name === "NotAllowedError" ? "blocked" : "error";
 }
 
 function gatewayUrlWithToken(url: string, token?: string, conversationId?: string) {
@@ -161,11 +190,13 @@ export function App() {
   const audioCaptureRef = useRef<AudioCapture | null>(null);
   const audioPlayerRef = useRef<PcmStreamPlayer | null>(null);
   const recognitionRef = useRef<any>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const microphoneStreamRef = useRef<MediaStream | null>(null);
   const assistantMessageIdRef = useRef<string | null>(null);
   const assistantPlaceholderRef = useRef(false);
   const assistantTextRef = useRef("");
   const assistantTextFromTtsRef = useRef(false);
+  const assistantAudioClipsRef = useRef<Record<string, Array<{ audio: string; sampleRate: number }>>>({});
   const ttsQueueRef = useRef<string[]>([]);
   const ttsPlayingRef = useRef(false);
   const recognitionPausedForTtsRef = useRef(false);
@@ -177,18 +208,23 @@ export function App() {
   const lastSubmittedSpeechRef = useRef<{ text: string; at: number } | null>(null);
   const lastSampleRef = useRef<Uint8ClampedArray | null>(null);
   const lastVisionAtRef = useRef(0);
+  const audioReadyForVisionRef = useRef(false);
+  const pendingSpeechFrameTimerRef = useRef(0);
   const speechFrameCountRef = useRef(0);
   const lastSpeechFrameAtRef = useRef(0);
+  const lastRealtimeAsrAtRef = useRef(0);
   const realtimeAudioRef = useRef(false);
   const modelAudioPlayingRef = useRef(false);
   const runningRef = useRef(false);
   const aiStateRef = useRef<AiState>("idle");
 
-  const [connectionState, setConnectionState] = useState("closed");
-  const [sessionReady, setSessionReady] = useState(false);
-  const [mediaReady, setMediaReady] = useState(false);
+  const [, setConnectionState] = useState("closed");
+  const [, setSessionReady] = useState(false);
+  const [, setMediaReady] = useState(false);
   const [mediaState, setMediaState] = useState("idle");
   const [mediaAction, setMediaAction] = useState<MediaAction>(null);
+  const [cameraStatus, setCameraStatus] = useState<DeviceStatus>("idle");
+  const [microphoneStatus, setMicrophoneStatus] = useState<DeviceStatus>("idle");
   const [level, setLevel] = useState(0);
   const [partial, setPartial] = useState("");
   const [sessions, setSessions] = useState<SessionMeta[]>([
@@ -201,12 +237,12 @@ export function App() {
   const [manualText, setManualText] = useState("");
   const [lastError, setLastError] = useState("");
   const [authError, setAuthError] = useState("");
-  const [permissionStatus, setPermissionStatus] = useState("等待启动");
-  const [asrStatus, setAsrStatus] = useState("未启动");
+  const [, setPermissionStatus] = useState("等待启动");
+  const [, setAsrStatus] = useState("未启动");
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [aiState, setAiState] = useState<AiState>("idle");
   const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>(() => loadStoredVoice());
-  const [realtimeAudio, setRealtimeAudio] = useState(false);
+  const [, setRealtimeAudio] = useState(false);
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [videoPanePercent, setVideoPanePercent] = useState(57.14);
   const [conversationsLoaded, setConversationsLoaded] = useState(false);
@@ -227,12 +263,6 @@ export function App() {
 
   const isProcessing = Boolean(assistantMessageIdRef.current);
   const canSend = manualText.trim().length > 0;
-  const gatewayReady = connectionState === "open" && sessionReady && mediaReady;
-  const permissionNeedsAction =
-    permissionStatus.includes("denied") ||
-    permissionStatus.includes("拒绝") ||
-    permissionStatus.includes("失败") ||
-    permissionStatus.includes("等待启动");
   const historySessions = useMemo<SessionListItem[]>(
     () =>
       sessions.map((session) => ({
@@ -362,6 +392,7 @@ export function App() {
   const beginAssistantResponse = useCallback(() => {
     const id = uid();
     assistantMessageIdRef.current = id;
+    assistantAudioClipsRef.current[id] = [];
     assistantPlaceholderRef.current = true;
     assistantTextRef.current = "";
     assistantTextFromTtsRef.current = false;
@@ -483,6 +514,21 @@ export function App() {
     [clearPendingSpeech, client, finishAssistant, stopModelAudio, stopSpeech],
   );
 
+  const replayAssistantAudio = useCallback(
+    (message: ChatMessage) => {
+      const chunks = assistantAudioClipsRef.current[message.id] ?? [];
+      if (chunks.length === 0) return false;
+      stopSpeech();
+      stopModelAudio();
+      const player = ensureAudioPlayer();
+      chunks.forEach((chunk) => {
+        void player.play(chunk.audio, chunk.sampleRate);
+      });
+      return true;
+    },
+    [ensureAudioPlayer, stopModelAudio, stopSpeech],
+  );
+
   const computeFrameStats = useCallback(() => {
     const video = videoRef.current;
     const sample = sampleRef.current;
@@ -526,6 +572,7 @@ export function App() {
 
   const captureFrame = useCallback(
     async (reason: string, force = false) => {
+      if (cameraStatus !== "active") return false;
       const video = videoRef.current;
       const canvas = canvasRef.current;
       if (!video || !canvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return false;
@@ -535,19 +582,43 @@ export function App() {
       const shouldSend = force || reason === "semantic" || now - lastVisionAtRef.current > 12000 || diff > 18;
       if (!shouldSend) return false;
 
-      const width = 720;
-      const height = Math.round((video.videoHeight / Math.max(video.videoWidth, 1)) * width) || 405;
-      canvas.width = width;
-      canvas.height = height;
       const context = canvas.getContext("2d");
       if (!context) return false;
-      context.drawImage(video, 0, 0, width, height);
-      const image = canvas.toDataURL("image/jpeg", reason === "semantic" ? 0.78 : 0.66);
+      const widths = [640, 520, 420];
+      const qualities = reason === "semantic" ? [0.72, 0.62, 0.52, 0.42] : [0.58, 0.48, 0.4];
+      let image = "";
+      for (const width of widths) {
+        const height = Math.round((video.videoHeight / Math.max(video.videoWidth, 1)) * width) || Math.round(width * 0.5625);
+        canvas.width = width;
+        canvas.height = height;
+        context.drawImage(video, 0, 0, width, height);
+        for (const quality of qualities) {
+          image = canvas.toDataURL("image/jpeg", quality);
+          if (imagePayloadSize(image) <= MAX_REALTIME_IMAGE_BASE64_BYTES) break;
+        }
+        if (imagePayloadSize(image) <= MAX_REALTIME_IMAGE_BASE64_BYTES) break;
+      }
       const sent = client.send("vision.frame", { image, reason, diff: Number(diff.toFixed(2)) });
       if (sent) lastVisionAtRef.current = now;
       return sent;
     },
-    [client, computeFrameStats],
+    [cameraStatus, client, computeFrameStats],
+  );
+
+  const captureSpeechFrame = useCallback(
+    (reason: "speech-start" | "speech-active") => {
+      window.clearTimeout(pendingSpeechFrameTimerRef.current);
+      const send = () => {
+        if (!runningRef.current || !audioReadyForVisionRef.current) return;
+        void captureFrame(reason, true);
+      };
+      if (audioReadyForVisionRef.current) {
+        send();
+        return;
+      }
+      pendingSpeechFrameTimerRef.current = window.setTimeout(send, 160);
+    },
+    [captureFrame],
   );
 
   const sendFinalTranscript = useCallback(
@@ -589,7 +660,7 @@ export function App() {
   );
 
   const scheduleRecognizedSpeech = useCallback(
-    (text: string) => {
+    (text: string, delayMs = SPEECH_AUTO_SEND_DELAY_MS) => {
       const clean = text.trim();
       if (!clean || recognitionPausedForTtsRef.current || recognitionDisabledRef.current) return;
 
@@ -599,7 +670,7 @@ export function App() {
         const pending = pendingSpeechRef.current.trim();
         if (!pending || !runningRef.current || recognitionPausedForTtsRef.current || recognitionDisabledRef.current) return;
         submitRecognizedSpeech(pending);
-      }, SPEECH_AUTO_SEND_DELAY_MS);
+      }, delayMs);
     },
     [submitRecognizedSpeech],
   );
@@ -612,21 +683,21 @@ export function App() {
         const enabled = event.capabilities.realtime === true;
         realtimeAudioRef.current = enabled;
         setRealtimeAudio(enabled);
-        if (enabled) {
-          setAsrStatus("Qwen Realtime ASR");
-          try {
-            recognitionRef.current?.stop?.();
-          } catch {
-            // Ignore duplicate stop.
-          }
-          recognitionRef.current = null;
-        }
+        if (enabled) setAsrStatus("Qwen Realtime ASR + 浏览器兜底");
       }
       if (event.type === "asr.partial") {
+        if (event.source === "realtime") {
+          lastRealtimeAsrAtRef.current = Date.now();
+          clearPendingSpeech();
+        }
         setPartial(event.text);
         setAiState("listening");
       }
       if (event.type === "asr.final") {
+        if (event.source === "realtime") {
+          lastRealtimeAsrAtRef.current = Date.now();
+          clearPendingSpeech();
+        }
         setPartial("");
         appendMessage({ id: uid(), role: "user", text: event.text });
         setSessions((current) =>
@@ -647,6 +718,13 @@ export function App() {
         updateAssistantDelta(event.delta);
       }
       if (event.type === "response.audio.delta") {
+        if (!assistantMessageIdRef.current) beginAssistantResponse();
+        const messageId = assistantMessageIdRef.current;
+        if (messageId) {
+          const clips = assistantAudioClipsRef.current[messageId] ?? [];
+          clips.push({ audio: event.audio, sampleRate: event.sampleRate });
+          assistantAudioClipsRef.current[messageId] = clips.slice(-800);
+        }
         void ensureAudioPlayer().play(event.audio, event.sampleRate);
       }
       if (event.type === "response.audio.done") {
@@ -658,7 +736,7 @@ export function App() {
         if (event.text?.trim() && (assistantTextFromTtsRef.current || !assistantTextRef.current.trim())) {
           updateAssistantDelta(event.text, "tts");
         }
-        if (!realtimeAudioRef.current) enqueueSpeech(event.text);
+        if (!realtimeAudioRef.current || assistantTextFromTtsRef.current) enqueueSpeech(event.text);
       }
       if (event.type === "llm.done") {
         finishAssistant(event.cancelled);
@@ -676,6 +754,7 @@ export function App() {
     [
       appendMessage,
       beginAssistantResponse,
+      clearPendingSpeech,
       currentSessionId,
       enqueueSpeech,
       ensureAudioPlayer,
@@ -731,10 +810,6 @@ export function App() {
   }, [checkMediaPermissions]);
 
   const startSpeechRecognition = useCallback(() => {
-    if (realtimeAudioRef.current) {
-      setAsrStatus("Qwen Realtime ASR");
-      return;
-    }
     if (recognitionRef.current || recognitionDisabledRef.current || recognitionPausedForTtsRef.current) return;
     const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
     if (!Recognition) {
@@ -748,9 +823,12 @@ export function App() {
     recognition.lang = "zh-CN";
     recognition.continuous = true;
     recognition.interimResults = true;
-    setAsrStatus("浏览器 ASR 运行中");
+    setAsrStatus(realtimeAudioRef.current ? "浏览器 ASR 兜底运行中" : "浏览器 ASR 运行中");
     recognition.onresult = (event: any) => {
       if (!runningRef.current || recognitionPausedForTtsRef.current || recognitionDisabledRef.current) return;
+      if (modelAudioPlayingRef.current || aiStateRef.current === "speaking") return;
+      const realtimeRecognizedRecently = realtimeAudioRef.current && Date.now() - lastRealtimeAsrAtRef.current < 2500;
+      if (realtimeRecognizedRecently) return;
       let interim = "";
       let finalText = "";
       for (let i = event.resultIndex; i < event.results.length; i += 1) {
@@ -763,12 +841,21 @@ export function App() {
         client.send("browser.asr.partial", { text: cleanInterim });
         scheduleRecognizedSpeech(cleanInterim);
       }
-      if (finalText.trim()) submitRecognizedSpeech(finalText.trim());
+      if (finalText.trim()) scheduleRecognizedSpeech(finalText.trim(), SPEECH_FINAL_SETTLE_DELAY_MS);
     };
     recognition.onerror = (event: any) => {
       const error = event.error ?? "unknown";
       if (error === "network") {
         recognitionDisabledRef.current = true;
+        if (realtimeAudioRef.current) {
+          setAsrStatus("Qwen Realtime ASR");
+          try {
+            recognition.stop();
+          } catch {
+            // Ignore duplicate stop.
+          }
+          return;
+        }
         setAsrStatus("ASR 网络不可用，已切换文本兜底");
         const message = "浏览器语音识别报 network。会话仍可继续，请用文本输入；麦克风音频流和成本统计仍在运行。";
         setLastError(message);
@@ -805,6 +892,7 @@ export function App() {
     () => () => {
       pendingSpeechRef.current = "";
       window.clearTimeout(pendingSpeechTimerRef.current);
+      window.clearTimeout(pendingSpeechFrameTimerRef.current);
       window.clearTimeout(recognitionRestartTimerRef.current);
     },
     [],
@@ -825,7 +913,7 @@ export function App() {
 
         speechFrameCountRef.current = 1;
         lastSpeechFrameAtRef.current = Date.now();
-        void captureFrame("speech-start", true);
+        captureSpeechFrame("speech-start");
       }
 
       if (snapshot.isSpeech && speechFrameCountRef.current > 0 && speechFrameCountRef.current < 2) {
@@ -833,7 +921,7 @@ export function App() {
         if (now - lastSpeechFrameAtRef.current > 1200) {
           speechFrameCountRef.current += 1;
           lastSpeechFrameAtRef.current = now;
-          void captureFrame("speech-active", true);
+          captureSpeechFrame("speech-active");
         }
       }
 
@@ -842,86 +930,128 @@ export function App() {
         lastSpeechFrameAtRef.current = 0;
       }
     },
-    [captureFrame, interruptActiveSpeech],
+    [captureSpeechFrame, interruptActiveSpeech],
   );
+
+  const stopCamera = useCallback(() => {
+    cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+    cameraStreamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setCameraStatus("idle");
+  }, []);
+
+  const requestCamera = useCallback(async () => {
+    if (cameraStatus === "active" || cameraStatus === "requesting") return;
+    setLastError("");
+    setCameraStatus("requesting");
+    setPermissionStatus("正在请求摄像头权限...");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+      });
+      cameraStreamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      setCameraStatus("active");
+      setPermissionStatus("摄像头已授权");
+    } catch (error) {
+      cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+      cameraStreamRef.current = null;
+      if (videoRef.current) videoRef.current.srcObject = null;
+      setCameraStatus(mediaStatusFromError(error));
+      const message = mediaErrorMessage("摄像头", error);
+      setPermissionStatus("摄像头启动失败");
+      setLastError(message);
+    }
+  }, [cameraStatus]);
+
+  const toggleCamera = useCallback(async () => {
+    if (cameraStatus === "requesting") return;
+    if (cameraStatus === "active") {
+      stopCamera();
+      setPermissionStatus("摄像头已关闭");
+      return;
+    }
+    await requestCamera();
+  }, [cameraStatus, requestCamera, stopCamera]);
   
   const startSession = useCallback(async () => {
     if (mediaAction || mediaState === "running") return;
     setMediaAction("start");
-    let grantedStream: MediaStream | null = null;
+    let microphoneStream: MediaStream | null = null;
+    let permissionStage: "microphone" | "session" = "microphone";
     try {
       if (!conversationsLoaded || !currentSessionId) {
         setLastError("会话历史正在加载，请稍后再启动。");
         return;
       }
       setLastError("");
-      setPermissionStatus("正在请求摄像头和麦克风权限...");
+      setPermissionStatus("正在请求麦克风权限...");
+      setMicrophoneStatus("requesting");
       setAsrStatus("准备启动");
       setSessionReady(false);
       setMediaReady(false);
+      recognitionDisabledRef.current = false;
+      recognitionPausedForTtsRef.current = false;
+      lastRealtimeAsrAtRef.current = 0;
+      audioReadyForVisionRef.current = false;
+      speechFrameCountRef.current = 0;
+      lastSpeechFrameAtRef.current = 0;
+      window.clearTimeout(pendingSpeechFrameTimerRef.current);
       clearPendingSpeech();
       client.close();
 
-      grantedStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+      microphoneStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
-      setPermissionStatus("摄像头和麦克风已授权");
+      microphoneStreamRef.current = microphoneStream;
+      setMicrophoneStatus("active");
+      setPermissionStatus("麦克风已授权");
       setMediaReady(true);
-      streamRef.current = grantedStream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = grantedStream;
-        await videoRef.current.play();
-      }
-      lastSampleRef.current = null;
-      lastVisionAtRef.current = 0;
 
+      permissionStage = "session";
       setConnectionState("connecting");
       client.connect();
       await client.waitOpen();
       client.send("session.start");
       client.send("session.voice.update", { voice: selectedVoice });
-      client.send("vision.clear", { reason: "session_started" });
-      window.setTimeout(() => {
-        void captureFrame("session-start", true);
-      }, 180);
 
-      const audioCapture = new AudioCapture(client, setLevel, handleVad);
-      await audioCapture.start(grantedStream);
+      const audioCapture = new AudioCapture(client, setLevel, handleVad, () => {
+        audioReadyForVisionRef.current = true;
+      });
+      await audioCapture.start(microphoneStream);
       audioCaptureRef.current = audioCapture;
       runningRef.current = true;
       setAiState("listening");
       setMediaState("running");
-      if (realtimeAudioRef.current) setAsrStatus("Qwen Realtime ASR");
-      else startSpeechRecognition();
+      startSpeechRecognition();
     } catch (error) {
-      const raw = error instanceof Error ? error.message : String(error);
-      let message = raw;
-      if (error instanceof DOMException) {
-        if (error.name === "NotAllowedError") message = "摄像头或麦克风权限被拒绝，请在浏览器地址栏权限设置中允许后重试。";
-        if (error.name === "NotFoundError") message = "没有检测到可用的摄像头或麦克风设备。";
-        if (error.name === "NotReadableError") message = "摄像头或麦克风被其他应用占用，请关闭占用后重试。";
-      }
-      grantedStream?.getTracks().forEach((track) => track.stop());
-      lastSampleRef.current = null;
-      lastVisionAtRef.current = 0;
-      if (client.state === "open") client.send("vision.clear", { reason: "session_start_failed" });
+      const message = permissionStage === "microphone" ? mediaErrorMessage("麦克风", error) : error instanceof Error ? error.message : String(error);
+      microphoneStream?.getTracks().forEach((track) => track.stop());
+      microphoneStreamRef.current = null;
       client.close();
       setSessionReady(false);
       setMediaReady(false);
       setPermissionStatus("启动失败");
+      setMicrophoneStatus(permissionStage === "microphone" ? mediaStatusFromError(error) : "error");
       setLastError(message);
       setMediaState("error");
       setConnectionState(client.state);
     } finally {
       setMediaAction(null);
     }
-  }, [captureFrame, clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, mediaAction, mediaState, selectedVoice, startSpeechRecognition]);
+  }, [clearPendingSpeech, client, conversationsLoaded, currentSessionId, handleVad, mediaAction, mediaState, selectedVoice, startSpeechRecognition]);
   const stopSession = useCallback(async () => {
     if (mediaAction === "stop") return;
     setMediaAction("stop");
     try {
       runningRef.current = false;
+      audioReadyForVisionRef.current = false;
+      speechFrameCountRef.current = 0;
+      lastSpeechFrameAtRef.current = 0;
+      window.clearTimeout(pendingSpeechFrameTimerRef.current);
       clearPendingSpeech();
       stopModelAudio();
       ttsQueueRef.current = [];
@@ -937,17 +1067,15 @@ export function App() {
       }
       recognitionRef.current = null;
       await audioCaptureRef.current?.stop();
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
+      microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
+      microphoneStreamRef.current = null;
       audioCaptureRef.current = null;
-      lastSampleRef.current = null;
-      lastVisionAtRef.current = 0;
-      if (client.state === "open") client.send("vision.clear", { reason: "session_stopped" });
       client.close();
       if (assistantMessageIdRef.current) finishAssistant(true);
       setSessionReady(false);
       setMediaReady(false);
       setMediaState("stopped");
+      setMicrophoneStatus("idle");
       setConnectionState("closed");
       setAsrStatus("已停止");
       setAiState("idle");
@@ -1014,7 +1142,10 @@ export function App() {
 
   const selectConversation = useCallback(
     async (id: string) => {
-      if (id === currentSessionId) return;
+      if (id === currentSessionId) {
+        setActiveView("chat");
+        return;
+      }
       setHistoryBusySessionId(id);
       setHistoryError("");
       try {
@@ -1125,10 +1256,11 @@ export function App() {
 
   const logout = useCallback(async () => {
     await stopSession();
+    stopCamera();
     setAuthSession(null);
     storeAuth(null);
     setAuthError("");
-  }, [stopSession]);
+  }, [stopCamera, stopSession]);
 
   const updateVoice = useCallback(
     (voice: RealtimeVoice) => {
@@ -1144,16 +1276,15 @@ export function App() {
   }
 
   return (
-    <main className="h-screen overflow-hidden bg-slate-50 text-slate-950">
+    <main className="h-screen overflow-hidden bg-white text-slate-950">
       <div
         className={cx(
           "grid h-screen min-h-0 max-lg:grid-cols-1",
           historyCollapsed
-            ? "grid-cols-[72px_58px_1fr] max-xl:grid-cols-[68px_54px_1fr]"
-            : "grid-cols-[72px_260px_1fr] max-xl:grid-cols-[68px_220px_1fr]",
+            ? "grid-cols-[64px_1fr]"
+            : "grid-cols-[280px_1fr] max-xl:grid-cols-[244px_1fr]",
         )}
       >
-        <IconSidebar activeView={activeView} setActiveView={setActiveView} />
         <HistoryRail
           busySessionId={historyBusySessionId}
           collapsed={historyCollapsed}
@@ -1161,27 +1292,24 @@ export function App() {
           error={historyError}
           onDeleteSession={deleteSession}
           onNewSession={startNewConversation}
+          onLogout={logout}
+          onOpenApiKeys={() => setActiveView("apiKeys")}
+          onOpenSettings={() => setActiveView("settings")}
+          onOpenUsage={() => setActiveView("usage")}
           onRenameSession={renameSession}
           onSelectSession={selectConversation}
           onToggle={() => setHistoryCollapsed((current) => !current)}
           sessions={historySessions}
+          user={authSession.user}
         />
 
-        <section className="flex min-h-0 min-w-0 flex-col border-l border-slate-200 bg-white">
-          <TopBar
-            activeView={activeView}
-            connectionState={connectionState}
-            gatewayReady={gatewayReady}
-            mediaAction={mediaAction}
-            mediaState={mediaState}
-            startSession={startSession}
-            stopSession={stopSession}
-          />
-
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6 pb-4 max-lg:px-4">
-            {permissionNeedsAction && (
-              <PermissionBanner mediaAction={mediaAction} permissionStatus={permissionStatus} startSession={startSession} />
+        <section className="flex min-h-0 min-w-0 flex-col bg-white">
+          <div
+            className={cx(
+              "flex min-h-0 flex-1 flex-col px-6 py-4 max-lg:px-4",
+              activeView === "chat" ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden",
             )}
+          >
             {lastError && (
               <div className="mb-4 flex items-center gap-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-800">
                 <WifiOff size={17} /> {lastError}
@@ -1192,18 +1320,20 @@ export function App() {
               <ChatView
                 aiState={aiState}
                 canSend={canSend}
-                captureFrame={captureFrame}
+                cameraStatus={cameraStatus}
                 handleComposerAction={handleComposerAction}
                 isProcessing={isProcessing}
                 level={level}
                 manualText={manualText}
                 mediaAction={mediaAction}
                 mediaState={mediaState}
+                microphoneStatus={microphoneStatus}
                 messages={messages}
-                onNewSession={startNewConversation}
                 partial={partial}
+                replayAssistantAudio={replayAssistantAudio}
                 setManualText={setManualText}
                 sendManual={sendManual}
+                toggleCamera={toggleCamera}
                 toggleVoiceSession={toggleVoiceSession}
                 videoRef={videoRef}
                 canvasRef={canvasRef}
@@ -1212,30 +1342,18 @@ export function App() {
                 setVideoPanePercent={setVideoPanePercent}
               />
             )}
-            {activeView === "cost" && (
-              <CostStation
-                apiBaseUrl={apiBaseUrl}
-                cost={cost}
-                connectionState={connectionState}
-                permissionStatus={permissionStatus}
-                asrStatus={asrStatus}
-                realtimeAudio={realtimeAudio}
-                token={authSession.accessToken}
+            {activeView === "settings" && (
+              <SettingsView
+                selectedVoice={selectedVoice}
+                setSelectedVoice={updateVoice}
+                user={authSession.user}
               />
             )}
             {activeView === "apiKeys" && (
               <ApiKeyManagementView apiBaseUrl={apiBaseUrl} token={authSession.accessToken} />
             )}
-            {activeView === "settings" && (
-              <SettingsView
-                gatewayUrl={gatewayUrl}
-                permissionStatus={permissionStatus}
-                asrStatus={asrStatus}
-                selectedVoice={selectedVoice}
-                setSelectedVoice={updateVoice}
-                user={authSession.user}
-                onLogout={logout}
-              />
+            {activeView === "usage" && (
+              <UsageStatsView apiBaseUrl={apiBaseUrl} cost={cost} token={authSession.accessToken} />
             )}
           </div>
         </section>
@@ -1330,35 +1448,6 @@ function AuthView({
   );
 }
 
-function IconSidebar({ activeView, setActiveView }: { activeView: AppView; setActiveView: (view: AppView) => void }) {
-  const items = [
-    { view: "chat" as const, icon: Radio, label: "实时对话" },
-    { view: "cost" as const, icon: BarChart3, label: "模型消耗" },
-    { view: "apiKeys" as const, icon: KeyRound, label: "API Key 管理" },
-    { view: "settings" as const, icon: Settings, label: "用户设置" },
-  ];
-  return (
-    <aside className="flex flex-col items-center gap-6 border-r border-slate-200 bg-slate-950 px-3 py-5 text-white max-lg:hidden">
-      <div className="grid h-11 w-11 place-items-center rounded-2xl bg-cyan-400 text-sm font-black text-slate-950 shadow-soft">AI</div>
-      <nav className="flex flex-col gap-3">
-        {items.map(({ view, icon: Icon, label }) => (
-          <button
-            key={view}
-            className={cx(
-              "grid h-11 w-11 place-items-center rounded-2xl transition",
-              activeView === view ? "bg-white text-slate-950" : "text-slate-400 hover:bg-white/10 hover:text-white",
-            )}
-            onClick={() => setActiveView(view)}
-            title={label}
-          >
-            <Icon size={20} />
-          </button>
-        ))}
-      </nav>
-    </aside>
-  );
-}
-
 function HistoryRail({
   busySessionId,
   collapsed,
@@ -1366,10 +1455,15 @@ function HistoryRail({
   error,
   onDeleteSession,
   onNewSession,
+  onLogout,
+  onOpenApiKeys,
+  onOpenSettings,
+  onOpenUsage,
   onRenameSession,
   onSelectSession,
   onToggle,
   sessions,
+  user,
 }: {
   busySessionId: string | null;
   collapsed: boolean;
@@ -1377,57 +1471,149 @@ function HistoryRail({
   error: string;
   onDeleteSession: (id: string) => Promise<void>;
   onNewSession: () => Promise<void>;
+  onLogout: () => Promise<void>;
+  onOpenApiKeys: () => void;
+  onOpenSettings: () => void;
+  onOpenUsage: () => void;
   onRenameSession: (id: string, title: string) => Promise<void>;
   onSelectSession: (id: string) => Promise<void>;
   onToggle: () => void;
   sessions: SessionListItem[];
+  user: AuthSession["user"];
 }) {
+  const initials = user.username.slice(0, 1).toUpperCase();
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  const toggleUserMenu = useCallback(() => {
+    setMenuOpen((current) => !current);
+  }, []);
+
+  const openSettings = useCallback(() => {
+    setMenuOpen(false);
+    onOpenSettings();
+  }, [onOpenSettings]);
+
+  const openApiKeys = useCallback(() => {
+    setMenuOpen(false);
+    onOpenApiKeys();
+  }, [onOpenApiKeys]);
+
+  const openUsage = useCallback(() => {
+    setMenuOpen(false);
+    onOpenUsage();
+  }, [onOpenUsage]);
+
+  const logoutFromMenu = useCallback(() => {
+    setMenuOpen(false);
+    void onLogout();
+  }, [onLogout]);
+
+  const createSessionFromRail = useCallback(() => {
+    setMenuOpen(false);
+    return onNewSession();
+  }, [onNewSession]);
+
+  const selectSessionFromRail = useCallback(
+    (id: string) => {
+      setMenuOpen(false);
+      return onSelectSession(id);
+    },
+    [onSelectSession],
+  );
+
+  const toggleRail = useCallback(() => {
+    setMenuOpen(false);
+    onToggle();
+  }, [onToggle]);
+
+  const userMenu = menuOpen ? (
+    <div
+      className={cx(
+        "absolute z-20 rounded-2xl border border-slate-200 bg-white p-2 text-sm font-semibold text-slate-700 shadow-xl",
+        collapsed ? "bottom-16 left-3 w-60" : "bottom-20 left-3 right-3",
+      )}
+    >
+      <button className="flex h-10 w-full items-center gap-3 rounded-xl px-3 text-left hover:bg-slate-100" onClick={openSettings} type="button">
+        <SlidersHorizontal size={17} /> 系统设置
+      </button>
+      <button className="flex h-10 w-full items-center gap-3 rounded-xl px-3 text-left hover:bg-slate-100" onClick={openApiKeys} type="button">
+        <KeyRound size={17} /> API Key 管理
+      </button>
+      <button className="flex h-10 w-full items-center gap-3 rounded-xl px-3 text-left hover:bg-slate-100" onClick={openUsage} type="button">
+        <BarChart3 size={17} /> 模型消耗统计
+      </button>
+      <button className="mt-1 flex h-10 w-full items-center gap-3 rounded-xl px-3 text-left text-rose-600 hover:bg-rose-50" onClick={logoutFromMenu} type="button">
+        <LogOut size={17} /> 用户登出
+      </button>
+    </div>
+  ) : null;
+
   if (collapsed) {
     return (
-      <aside className="flex flex-col items-center gap-3 border-r border-slate-200 bg-slate-100/80 py-4 max-lg:hidden">
+      <aside className="relative flex flex-col items-center gap-3 border-r border-slate-200 bg-slate-50 py-3 max-lg:hidden">
         <button
-          className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50"
-          onClick={onToggle}
+          className="grid h-10 w-10 place-items-center rounded-xl text-slate-700 hover:bg-slate-100"
+          onClick={toggleRail}
           title="展开历史记录"
           type="button"
         >
           <PanelLeftOpen size={18} />
         </button>
         <button
-          className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+          className="grid h-10 w-10 place-items-center rounded-xl text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
           disabled={busySessionId === NEW_SESSION_BUSY_ID}
-          onClick={() => void onNewSession()}
+          onClick={createSessionFromRail}
           title="新会话"
           type="button"
         >
           <Plus size={18} />
         </button>
+        {userMenu}
+        <div className="mt-auto flex flex-col items-center gap-2">
+          <button
+            className="grid h-10 w-10 place-items-center rounded-xl text-slate-600 hover:bg-slate-100"
+            onClick={toggleUserMenu}
+            aria-label="打开用户菜单"
+            title="用户菜单"
+            type="button"
+          >
+            <MoreHorizontal size={18} />
+          </button>
+          <button
+            className="grid h-10 w-10 place-items-center rounded-full bg-slate-900 text-sm font-bold text-white"
+            onClick={openSettings}
+            title="系统设置"
+            type="button"
+          >
+            {initials}
+          </button>
+        </div>
       </aside>
     );
   }
 
   return (
-    <aside className="border-r border-slate-200 bg-slate-100/80 p-4 max-lg:hidden">
-      <div className="mb-5 flex gap-2">
+    <aside className="relative flex min-h-0 flex-col border-r border-slate-200 bg-slate-50 p-3 max-lg:hidden">
+      <div className="mb-4 flex gap-2">
         <button
-          className="flex h-11 flex-1 items-center gap-2 rounded-2xl bg-white px-4 text-sm font-bold text-slate-800 shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
+          className="flex h-11 flex-1 items-center gap-2 rounded-xl px-3 text-sm font-semibold text-slate-900 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
           disabled={busySessionId === NEW_SESSION_BUSY_ID}
-          onClick={() => void onNewSession()}
+          onClick={createSessionFromRail}
           type="button"
         >
           <Plus size={17} /> {busySessionId === NEW_SESSION_BUSY_ID ? "创建中..." : "新会话"}
         </button>
-        <button className="grid h-11 w-11 place-items-center rounded-2xl bg-white text-slate-600 shadow-sm hover:bg-slate-50" onClick={onToggle} title="收起历史记录" type="button">
+        <button className="grid h-11 w-11 place-items-center rounded-xl text-slate-600 hover:bg-slate-100" onClick={toggleRail} title="收起历史记录" type="button">
           <PanelLeftClose size={18} />
         </button>
       </div>
-      <div className="mb-3 flex items-center gap-2 text-xs font-black uppercase tracking-wide text-slate-500">
-        <History size={15} /> 历史记录
+      <div className="mb-3 flex items-center gap-2 px-2 text-xs font-bold text-slate-500">
+        <History size={15} /> 最近
       </div>
       {error && <p className="mb-3 rounded-2xl bg-rose-50 px-3 py-2 text-xs font-bold text-rose-700">{error}</p>}
-      <div className="space-y-2">
+      <div className="min-h-0 flex-1 space-y-1 overflow-auto">
         {sessions.length === 0 ? (
-          <p className="rounded-2xl border border-dashed border-slate-300 p-4 text-sm text-slate-500">暂无会话历史</p>
+          <p className="rounded-xl border border-dashed border-slate-300 p-4 text-sm text-slate-500">暂无会话历史</p>
         ) : (
           sessions.map((session) => (
             <HistorySessionItem
@@ -1436,11 +1622,32 @@ function HistoryRail({
               busy={busySessionId === session.id}
               onDeleteSession={onDeleteSession}
               onRenameSession={onRenameSession}
-              onSelectSession={onSelectSession}
+              onSelectSession={selectSessionFromRail}
               session={session}
             />
           ))
         )}
+      </div>
+      {userMenu}
+      <div className="mt-3 flex h-12 items-center gap-2 rounded-xl px-2 hover:bg-slate-100">
+        <button className="flex min-w-0 flex-1 items-center gap-3 text-left" onClick={openSettings} type="button">
+          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-slate-900 text-sm font-bold text-white">
+            {initials}
+          </span>
+          <span className="min-w-0">
+            <span className="block truncate text-sm font-semibold text-slate-900">{user.username}</span>
+            <span className="block text-xs text-slate-500">用户管理与设置</span>
+          </span>
+        </button>
+        <button
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-slate-500 hover:bg-white hover:text-slate-900"
+          onClick={toggleUserMenu}
+          aria-label="打开用户菜单"
+          title="更多用户选项"
+          type="button"
+        >
+          <MoreHorizontal size={18} />
+        </button>
       </div>
     </aside>
   );
@@ -1496,8 +1703,8 @@ function HistorySessionItem({
   return (
     <article
       className={cx(
-        "rounded-2xl px-3 py-3 transition",
-        active ? "bg-white text-slate-950 shadow-sm" : "text-slate-600 hover:bg-white",
+        "rounded-xl px-2 py-2 transition",
+        active ? "bg-slate-200/70 text-slate-950" : "text-slate-600 hover:bg-slate-100",
       )}
     >
       {isEditing ? (
@@ -1545,7 +1752,7 @@ function HistorySessionItem({
               <MessageSquare className="shrink-0" size={15} />
               <span className="truncate">{session.title}</span>
             </span>
-            <span className="mt-1 block text-xs font-semibold text-slate-400">
+            <span className="mt-1 block text-xs font-medium text-slate-400">
               {session.updatedAt} · {session.messageCount} 条消息
             </span>
           </button>
@@ -1575,113 +1782,116 @@ function HistorySessionItem({
   );
 }
 
-function TopBar({
-  activeView,
-  connectionState,
-  gatewayReady,
-  mediaAction,
-  mediaState,
-  startSession,
-  stopSession,
+function VoicePicker({
+  selectedVoice,
+  setSelectedVoice,
 }: {
-  activeView: AppView;
-  connectionState: string;
-  gatewayReady: boolean;
-  mediaAction: MediaAction;
-  mediaState: string;
-  startSession: () => Promise<void>;
-  stopSession: () => Promise<void>;
+  selectedVoice: RealtimeVoice;
+  setSelectedVoice: (voice: RealtimeVoice) => void;
 }) {
-  const gatewayLabel = gatewayReady ? "Gateway 已就绪" : connectionState === "open" ? "Gateway 待授权" : "Gateway 未连接";
-  const isStarting = mediaAction === "start";
-  const isStopping = mediaAction === "stop";
   return (
-    <header className="flex min-h-16 items-center justify-between gap-4 border-b border-slate-200 px-7 py-3 max-md:flex-col max-md:items-start max-md:px-4">
-      <div>
-        <h1 className="text-xl font-black tracking-tight">
-          {activeView === "chat"
-            ? "AI 视觉对话助手"
-            : activeView === "cost"
-              ? "模型消耗中转站"
-              : activeView === "apiKeys"
-                ? "API Key 管理"
-                : "用户设置"}
-        </h1>
-        <p className="mt-0.5 text-xs font-semibold text-slate-500">Tailwind UI · WebSocket Gateway · Pipecat-ready Pipeline · 视觉关键帧</p>
+    <section className="mt-4 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-black text-slate-900">音色选择</h2>
+          <p className="mt-0.5 text-xs font-semibold text-slate-500">下一次模型音频回复将使用所选音色。</p>
+        </div>
+        <Volume2 size={18} className="text-slate-400" />
       </div>
-      <div className="flex items-center gap-3">
-        <StatusPill label={gatewayLabel} active={gatewayReady} />
-        {mediaState !== "running" ? (
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-2 2xl:grid-cols-4">
+        {realtimeVoices.map((voice) => (
           <button
-            className="inline-flex h-10 items-center gap-2 rounded-2xl bg-emerald-700 px-5 text-sm font-bold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={mediaAction !== null}
-            onClick={() => void startSession()}
+            key={voice}
+            className={cx(
+              "h-10 rounded-2xl text-sm font-black transition",
+              selectedVoice === voice
+                ? "bg-slate-950 text-white shadow-sm"
+                : "bg-slate-50 text-slate-600 ring-1 ring-slate-200 hover:bg-white",
+            )}
+            onClick={() => setSelectedVoice(voice)}
             type="button"
           >
-            <Play size={18} /> {isStarting ? "启动中..." : "启动会话"}
+            {voice}
           </button>
-        ) : (
-          <button
-            className="inline-flex h-10 items-center gap-2 rounded-2xl bg-rose-600 px-5 text-sm font-bold text-white hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={mediaAction !== null}
-            onClick={() => void stopSession()}
-            type="button"
-          >
-            <CircleStop size={18} /> {isStopping ? "停止中..." : "停止"}
-          </button>
-        )}
+        ))}
       </div>
-    </header>
+    </section>
   );
 }
 
-function PermissionBanner({
-  mediaAction,
-  permissionStatus,
-  startSession,
-}: {
-  mediaAction: MediaAction;
-  permissionStatus: string;
-  startSession: () => Promise<void>;
-}) {
+const visionQuickPrompts = [
+  {
+    icon: Eye,
+    label: "描述画面",
+    description: "主体、位置和明显细节",
+    prompt: "请描述你现在看到的画面，先说主体、位置和明显细节。",
+  },
+  {
+    icon: FileText,
+    label: "识别文字",
+    description: "读取画面中的文字或标识",
+    prompt: "请帮我识别画面里能看到的文字或标识，并说明它们可能代表什么。",
+  },
+  {
+    icon: Check,
+    label: "检查异常",
+    description: "提醒需要注意的地方",
+    prompt: "请检查当前画面里有没有异常、风险或需要我注意的地方。",
+  },
+  {
+    icon: Radio,
+    label: "解释变化",
+    description: "结合最近画面变化",
+    prompt: "请结合刚才到现在的画面变化，说明发生了什么。",
+  },
+] as const;
+
+function VisionQuickPrompts({ onSelectPrompt }: { onSelectPrompt: (prompt: string) => void }) {
   return (
-    <div className="mb-4 flex items-center justify-between gap-4 rounded-3xl border border-amber-200 bg-amber-50 px-5 py-4 text-amber-950 shadow-sm max-md:flex-col max-md:items-start">
-      <div className="flex items-center gap-3">
-        <div className="grid h-10 w-10 place-items-center rounded-2xl bg-amber-200">
-          <Shield size={20} />
-        </div>
-        <div>
-          <strong className="block text-sm">需要摄像头与麦克风权限</strong>
-          <span className="text-sm text-amber-800">{permissionStatus}。点击请求后浏览器会弹出权限提示。</span>
-        </div>
+    <section className="mt-5 rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="mb-3">
+        <h2 className="text-sm font-black text-slate-900">视觉快捷提问</h2>
+        <p className="mt-0.5 text-xs font-semibold text-slate-500">围绕当前摄像头画面生成问题。</p>
       </div>
-      <button
-        className="rounded-2xl bg-amber-900 px-4 py-2 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-60"
-        disabled={mediaAction !== null}
-        onClick={() => void startSession()}
-        type="button"
-      >
-        {mediaAction === "start" ? "请求中..." : "请求权限"}
-      </button>
-    </div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {visionQuickPrompts.map(({ icon: Icon, label, description, prompt }) => (
+          <button
+            key={label}
+            className="flex min-h-16 items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3 text-left transition hover:border-slate-300 hover:bg-white hover:shadow-sm"
+            onClick={() => onSelectPrompt(prompt)}
+            type="button"
+          >
+            <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white text-slate-700 ring-1 ring-slate-200">
+              <Icon size={17} />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-sm font-black text-slate-900">{label}</span>
+              <span className="mt-0.5 block text-xs font-semibold text-slate-500">{description}</span>
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
   );
 }
 
 function ChatView(props: {
   aiState: AiState;
   canSend: boolean;
-  captureFrame: (reason: string, force?: boolean) => Promise<boolean>;
+  cameraStatus: DeviceStatus;
   handleComposerAction: () => void;
   isProcessing: boolean;
   level: number;
   manualText: string;
   mediaAction: MediaAction;
   mediaState: string;
+  microphoneStatus: DeviceStatus;
   messages: ChatMessage[];
-  onNewSession: () => Promise<void>;
   partial: string;
+  replayAssistantAudio: (message: ChatMessage) => boolean;
   setManualText: (text: string) => void;
   sendManual: () => Promise<void>;
+  toggleCamera: () => Promise<void>;
   toggleVoiceSession: () => Promise<void>;
   videoRef: React.RefObject<HTMLVideoElement | null>;
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
@@ -1692,18 +1902,20 @@ function ChatView(props: {
   const {
     aiState,
     canSend,
-    captureFrame,
+    cameraStatus,
     handleComposerAction,
     isProcessing,
     level,
     manualText,
     mediaAction,
     mediaState,
+    microphoneStatus,
     messages,
-    onNewSession,
     partial,
+    replayAssistantAudio,
     setManualText,
     sendManual,
+    toggleCamera,
     toggleVoiceSession,
     videoRef,
     canvasRef,
@@ -1714,10 +1926,10 @@ function ChatView(props: {
   const messageScrollerRef = useRef<HTMLDivElement | null>(null);
   const gridRef = useRef<HTMLElement | null>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = messageScrollerRef.current;
     if (!element) return;
-    element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+    element.scrollTop = element.scrollHeight;
   }, [isProcessing, messages, partial]);
 
   const beginPaneResize = useCallback(
@@ -1751,21 +1963,15 @@ function ChatView(props: {
         } as React.CSSProperties
       }
     >
-      <div className="min-h-0 min-w-0">
+      <div className="min-h-0 min-w-0 overflow-auto pr-1">
         <div className="relative aspect-[4/3] overflow-hidden rounded-3xl border border-slate-200 bg-slate-900 shadow-soft">
           <video ref={videoRef} playsInline muted className="h-full w-full object-cover" />
           <canvas ref={canvasRef} hidden />
           <canvas ref={sampleRef} hidden />
           <AiStatusIndicator state={aiState} />
-          <div className="absolute inset-x-4 bottom-4 flex items-center justify-between gap-3">
-            <span className="inline-flex h-10 items-center gap-2 rounded-2xl bg-slate-950/70 px-4 text-sm font-bold text-white backdrop-blur">
-              <Camera size={16} /> 关键帧模式
-            </span>
-            <button className="inline-flex h-10 items-center gap-2 rounded-2xl bg-white/90 px-4 text-sm font-bold text-slate-800" onClick={() => void captureFrame("manual", true)}>
-              <Eye size={16} /> 抓取画面
-            </button>
-          </div>
+          <CameraStatusDot status={cameraStatus} />
         </div>
+        <VisionQuickPrompts onSelectPrompt={setManualText} />
       </div>
 
       <button
@@ -1774,17 +1980,19 @@ function ChatView(props: {
         title="拖拽调整视频和对话宽度"
       />
 
-      <div className="flex min-h-0 min-w-0 flex-col rounded-3xl border border-slate-200 bg-white shadow-soft">
-        <div className="flex min-h-16 items-center justify-between border-b border-slate-200 px-5">
+      <div className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-[2rem] border border-slate-200 bg-white shadow-sm">
+        <div className="flex min-h-16 items-center justify-between border-b border-slate-100 px-5">
           <div className="flex items-center gap-2 font-black"><Radio size={18} /> 实时对话</div>
           {partial && <div className="max-w-[52%] truncate rounded-full bg-cyan-50 px-3 py-1 text-sm font-bold text-cyan-700">正在听：{partial}</div>}
         </div>
-        <div ref={messageScrollerRef} className="flex-1 space-y-5 overflow-auto px-6 py-6">
-          {messages.map((message) => {
-            if (message.role === "assistant" && !message.text.trim()) return null;
-            if (message.role === "system") return null;
-            return <MessageBubble key={message.id} message={message} />;
-          })}
+        <div ref={messageScrollerRef} className="flex-1 overflow-auto bg-white px-4 py-7">
+          <div className="mx-auto flex w-full max-w-xl flex-col gap-7">
+            {messages.map((message) => {
+              if (message.role === "assistant" && !message.text.trim()) return null;
+              if (message.role === "system") return null;
+              return <MessageBubble key={message.id} message={message} onReplayAudio={replayAssistantAudio} />;
+            })}
+          </div>
         </div>
         <Composer
           canSend={canSend}
@@ -1794,9 +2002,11 @@ function ChatView(props: {
           manualText={manualText}
           mediaAction={mediaAction}
           mediaState={mediaState}
-          onNewSession={onNewSession}
+          microphoneStatus={microphoneStatus}
           sendManual={sendManual}
           setManualText={setManualText}
+          toggleCamera={toggleCamera}
+          cameraStatus={cameraStatus}
           toggleVoiceSession={toggleVoiceSession}
         />
       </div>
@@ -1804,24 +2014,111 @@ function ChatView(props: {
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function MessageBubble({ message, onReplayAudio }: { message: ChatMessage; onReplayAudio: (message: ChatMessage) => boolean }) {
   const isUser = message.role === "user";
+  const isAssistant = message.role === "assistant";
+  const [copied, setCopied] = useState(false);
+  const [feedback, setFeedback] = useState<"up" | "down" | null>(null);
+  const copyResetTimerRef = useRef(0);
+
+  useEffect(
+    () => () => {
+      window.clearTimeout(copyResetTimerRef.current);
+    },
+    [],
+  );
+
+  const copyMessage = useCallback(async () => {
+    const text = message.text.trim();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.clearTimeout(copyResetTimerRef.current);
+      copyResetTimerRef.current = window.setTimeout(() => setCopied(false), 1400);
+    } catch {
+      setCopied(false);
+    }
+  }, [message.text]);
+
+  const speakMessage = useCallback(() => {
+    if (onReplayAudio(message)) return;
+    const text = message.text.trim();
+    if (!text || !("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "zh-CN";
+    utterance.rate = 0.98;
+    utterance.pitch = 1;
+    window.speechSynthesis.speak(utterance);
+  }, [message, onReplayAudio]);
+
+  const togglePositiveFeedback = useCallback(() => {
+    setFeedback((current) => (current === "up" ? null : "up"));
+  }, []);
+
+  const toggleNegativeFeedback = useCallback(() => {
+    setFeedback((current) => (current === "down" ? null : "down"));
+  }, []);
+
   return (
-    <article className={cx("flex", isUser ? "justify-end" : "justify-start")}>
+    <article className={cx("flex w-full", isUser ? "justify-end" : "justify-start")}>
       <div
         className={cx(
-          "max-w-[78%] rounded-[1.35rem] px-5 py-4 shadow-sm",
-          isUser && "bg-slate-950 text-white",
-          message.role === "assistant" && "bg-white text-slate-900 ring-1 ring-slate-200",
+          "break-words text-[15px] leading-7",
+          isUser && "rounded-[1.6rem] bg-slate-100 px-5 py-3 text-slate-800",
+          isUser && "max-w-[min(70%,28rem)]",
+          isAssistant && "max-w-[30rem] px-1 py-1 text-slate-950",
         )}
       >
-        <span className={cx("mb-2 block text-xs font-black uppercase tracking-wide", isUser ? "text-white/60" : "text-slate-400")}>
-          {message.role === "assistant" ? "AI" : message.role === "user" ? "你" : "系统"}
-        </span>
         <p className="whitespace-pre-wrap break-words leading-7">
           {message.text}
           {message.streaming && message.text ? <span className="ml-1 animate-pulse">▌</span> : null}
         </p>
+        {isAssistant && message.text.trim() && !message.streaming ? (
+          <div className="mt-3 flex items-center gap-1 text-slate-500">
+            <button
+              className="grid h-8 w-8 place-items-center rounded-full transition hover:bg-slate-100 hover:text-slate-900"
+              onClick={copyMessage}
+              title={copied ? "已复制" : "复制回复"}
+              type="button"
+            >
+              {copied ? <Check size={16} /> : <Copy size={16} />}
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-full transition hover:bg-slate-100 hover:text-slate-900"
+              onClick={speakMessage}
+              title="朗读回复"
+              type="button"
+            >
+              <Volume2 size={16} />
+            </button>
+            <button
+              aria-pressed={feedback === "up"}
+              className={cx(
+                "grid h-8 w-8 place-items-center rounded-full transition hover:bg-slate-100 hover:text-slate-900",
+                feedback === "up" && "bg-slate-100 text-slate-950",
+              )}
+              onClick={togglePositiveFeedback}
+              title="回复有帮助"
+              type="button"
+            >
+              <ThumbsUp size={16} />
+            </button>
+            <button
+              aria-pressed={feedback === "down"}
+              className={cx(
+                "grid h-8 w-8 place-items-center rounded-full transition hover:bg-slate-100 hover:text-slate-900",
+                feedback === "down" && "bg-slate-100 text-slate-950",
+              )}
+              onClick={toggleNegativeFeedback}
+              title="回复不准确"
+              type="button"
+            >
+              <ThumbsDown size={16} />
+            </button>
+          </div>
+        ) : null}
       </div>
     </article>
   );
@@ -1829,35 +2126,42 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 
 function Composer({
   canSend,
+  cameraStatus,
   handleComposerAction,
   isProcessing,
   level,
   manualText,
   mediaAction,
   mediaState,
-  onNewSession,
+  microphoneStatus,
   sendManual,
   setManualText,
+  toggleCamera,
   toggleVoiceSession,
 }: {
   canSend: boolean;
+  cameraStatus: DeviceStatus;
   handleComposerAction: () => void;
   isProcessing: boolean;
   level: number;
   manualText: string;
   mediaAction: MediaAction;
   mediaState: string;
-  onNewSession: () => Promise<void>;
+  microphoneStatus: DeviceStatus;
   sendManual: () => Promise<void>;
   setManualText: (text: string) => void;
+  toggleCamera: () => Promise<void>;
   toggleVoiceSession: () => Promise<void>;
 }) {
-  const voiceButtonTitle = mediaState === "running" ? "停止语音会话" : "启动语音会话";
+  const cameraActive = cameraStatus === "active";
+  const microphoneActive = microphoneStatus === "active" || mediaState === "running";
+  const cameraButtonTitle = cameraActive ? "关闭摄像头权限" : "请求摄像头权限";
+  const voiceButtonTitle = microphoneActive ? "关闭麦克风权限" : "请求麦克风权限并开启实时语音";
   return (
-    <div className="border-t border-slate-200 p-4">
-      <div className="rounded-[2rem] border border-slate-200 bg-white p-3 shadow-soft">
+    <div className="border-t border-slate-100 bg-white px-5 py-5">
+      <div className="mx-auto w-full max-w-xl rounded-[2rem] border border-slate-200 bg-white px-4 py-3 shadow-[0_10px_30px_rgba(15,23,42,0.08)]">
         <textarea
-          className="min-h-16 w-full resize-none border-0 bg-transparent px-3 pt-2 text-base leading-7 text-slate-900 outline-none placeholder:text-slate-400"
+          className="min-h-12 w-full resize-none border-0 bg-transparent px-1 pt-1 text-base leading-7 text-slate-900 outline-none placeholder:text-slate-400"
           value={manualText}
           onChange={(event) => setManualText(event.target.value)}
           onKeyDown={(event) => {
@@ -1866,23 +2170,32 @@ function Composer({
               if (!isProcessing && canSend) void sendManual();
             }
           }}
-          placeholder="要求后续变更"
+          placeholder="输入消息，或点击麦克风开始实时对话"
           rows={2}
         />
-        <div className="flex items-center gap-3 px-2 pb-1">
-          <button
-            className="grid h-10 w-10 place-items-center rounded-full text-slate-500 hover:bg-slate-100"
-            onClick={() => void onNewSession()}
-            title="新会话"
-            type="button"
-          >
-            <Plus size={22} />
-          </button>
-          <div className="ml-auto flex items-center gap-3">
+        <div className="flex items-center justify-between gap-3 px-1 pb-1">
+          <span className="text-xs font-semibold text-slate-400">
+            {microphoneActive ? "实时语音进行中" : cameraActive ? "摄像头已开启，文字问题可携带画面" : "文字可直接发送，按需开启摄像头或麦克风"}
+          </span>
+          <div className="flex shrink-0 items-center gap-2">
             <button
               className={cx(
-                "grid h-10 w-10 place-items-center rounded-full text-slate-500 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60",
-                mediaState === "running" && "bg-emerald-50 text-emerald-700 hover:bg-emerald-100",
+                "grid h-11 w-11 place-items-center rounded-full text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60",
+                cameraActive && "bg-emerald-50 text-emerald-700 hover:bg-emerald-100",
+                cameraStatus === "blocked" && "bg-rose-50 text-rose-700 hover:bg-rose-100",
+              )}
+              disabled={cameraStatus === "requesting"}
+              onClick={() => void toggleCamera()}
+              title={cameraButtonTitle}
+              type="button"
+            >
+              <Camera size={20} />
+            </button>
+            <button
+              className={cx(
+                "grid h-11 w-11 place-items-center rounded-full text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60",
+                microphoneActive && "bg-amber-50 text-amber-700 hover:bg-amber-100",
+                microphoneStatus === "blocked" && "bg-rose-50 text-rose-700 hover:bg-rose-100",
               )}
               disabled={mediaAction !== null}
               onClick={() => void toggleVoiceSession()}
@@ -1893,10 +2206,10 @@ function Composer({
             </button>
             <button
               className={cx(
-                "grid h-12 w-12 place-items-center rounded-full transition",
+                "grid h-11 w-11 place-items-center rounded-full transition",
                 isProcessing && "bg-slate-950 text-white hover:bg-slate-800",
-                !isProcessing && canSend && "bg-slate-900 text-white hover:bg-slate-700",
-                !isProcessing && !canSend && "cursor-not-allowed bg-slate-200 text-slate-400",
+                !isProcessing && canSend && "bg-blue-600 text-white hover:bg-blue-700",
+                !isProcessing && !canSend && "cursor-not-allowed bg-slate-100 text-slate-400",
               )}
               disabled={!isProcessing && !canSend}
               onClick={handleComposerAction}
@@ -1907,7 +2220,7 @@ function Composer({
             </button>
           </div>
         </div>
-        <div className="mt-2 flex items-center gap-3 rounded-2xl bg-slate-50 px-3 py-2">
+        <div className="mt-3 flex items-center gap-3 rounded-2xl bg-slate-50 px-3 py-2">
           <Mic size={16} className="text-slate-500" />
           <span className="text-xs font-black text-slate-500">麦克风流</span>
           <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-200">
@@ -1916,6 +2229,20 @@ function Composer({
         </div>
       </div>
     </div>
+  );
+}
+
+function CameraStatusDot({ status }: { status: DeviceStatus }) {
+  const active = status === "active";
+  return (
+    <span
+      aria-label={active ? "摄像头已开启" : "摄像头未开启"}
+      className={cx(
+        "absolute right-4 top-4 h-3.5 w-3.5 rounded-full ring-4 ring-slate-950/35",
+        active ? "bg-emerald-400" : "bg-rose-500",
+      )}
+      title={active ? "摄像头已开启" : "摄像头未开启"}
+    />
   );
 }
 
@@ -1952,7 +2279,171 @@ function AiStatusIndicator({ state }: { state: AiState }) {
   );
 }
 
-type ModelConfigForm = Omit<ModelConfigUpdate, "apiKey" | "clearApiKey"> & { apiKey: string };
+function SettingsView({
+  selectedVoice,
+  setSelectedVoice,
+  user,
+}: {
+  selectedVoice: RealtimeVoice;
+  setSelectedVoice: (voice: RealtimeVoice) => void;
+  user: AuthSession["user"];
+}) {
+  return (
+    <section className="max-w-3xl rounded-[2rem] border border-slate-200 bg-white p-7 shadow-soft">
+      <div>
+        <h2 className="text-2xl font-black">系统设置</h2>
+        <p className="mt-1 text-sm font-semibold text-slate-500">管理账号资料和实时语音偏好。</p>
+      </div>
+      <div className="mt-6 grid gap-4">
+        <ReadonlyField label="用户名" value={user.username} />
+        <ReadonlyField label="用户 ID" value={user.id} />
+        <VoicePicker selectedVoice={selectedVoice} setSelectedVoice={setSelectedVoice} />
+      </div>
+    </section>
+  );
+}
+
+type ModelConfigForm = ModelConfigUpdate & { apiKey: string };
+type ProviderPreset = {
+  id: string;
+  name: string;
+  badge?: string;
+  description: string;
+  baseUrl: string;
+  chatModel: string;
+  supportsRealtime: boolean;
+  realtimeEnabled: boolean;
+  realtimeBaseUrl: string;
+  realtimeModel: string;
+  realtimeVoice: string;
+};
+
+const providerPresets: ProviderPreset[] = [
+  {
+    id: "dashscope",
+    name: "阿里云百炼",
+    badge: "Omni",
+    description: "DashScope 兼容模式，支持 Qwen Omni Realtime。",
+    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    chatModel: "qwen3.5-omni-plus",
+    supportsRealtime: true,
+    realtimeEnabled: true,
+    realtimeBaseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    realtimeModel: "qwen3-omni-flash-realtime",
+    realtimeVoice: "Cherry",
+  },
+  {
+    id: "deepseek",
+    name: "DeepSeek",
+    badge: "常用",
+    description: "DeepSeek 官方 OpenAI 兼容接口。",
+    baseUrl: "https://api.deepseek.com",
+    chatModel: "deepseek-chat",
+    supportsRealtime: false,
+    realtimeEnabled: false,
+    realtimeBaseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    realtimeModel: "qwen3-omni-flash-realtime",
+    realtimeVoice: "Cherry",
+  },
+  {
+    id: "zhipu",
+    name: "智谱 GLM",
+    description: "智谱开放平台 GLM 系列模型。",
+    baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+    chatModel: "glm-4.5",
+    supportsRealtime: false,
+    realtimeEnabled: false,
+    realtimeBaseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    realtimeModel: "qwen3-omni-flash-realtime",
+    realtimeVoice: "Cherry",
+  },
+  {
+    id: "moonshot",
+    name: "Moonshot Kimi",
+    description: "月之暗面 Kimi OpenAI 兼容接口。",
+    baseUrl: "https://api.moonshot.cn/v1",
+    chatModel: "kimi-k2-0711-preview",
+    supportsRealtime: false,
+    realtimeEnabled: false,
+    realtimeBaseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    realtimeModel: "qwen3-omni-flash-realtime",
+    realtimeVoice: "Cherry",
+  },
+  {
+    id: "baidu",
+    name: "百度千帆",
+    description: "千帆 ModelBuilder OpenAI 兼容入口。",
+    baseUrl: "https://qianfan.baidubce.com/v2",
+    chatModel: "ernie-4.5-turbo-vl",
+    supportsRealtime: false,
+    realtimeEnabled: false,
+    realtimeBaseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    realtimeModel: "qwen3-omni-flash-realtime",
+    realtimeVoice: "Cherry",
+  },
+  {
+    id: "tencent",
+    name: "腾讯混元",
+    description: "混元 OpenAI 兼容 Chat Completions。",
+    baseUrl: "https://api.hunyuan.cloud.tencent.com/v1",
+    chatModel: "hunyuan-turbos-vision",
+    supportsRealtime: false,
+    realtimeEnabled: false,
+    realtimeBaseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    realtimeModel: "qwen3-omni-flash-realtime",
+    realtimeVoice: "Cherry",
+  },
+  {
+    id: "volcengine",
+    name: "火山方舟",
+    description: "火山引擎方舟推理接入点。",
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+    chatModel: "doubao-1-5-vision-pro-32k",
+    supportsRealtime: false,
+    realtimeEnabled: false,
+    realtimeBaseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    realtimeModel: "qwen3-omni-flash-realtime",
+    realtimeVoice: "Cherry",
+  },
+  {
+    id: "siliconflow",
+    name: "硅基流动",
+    badge: "聚合",
+    description: "国内聚合平台，适合快速切模型。",
+    baseUrl: "https://api.siliconflow.cn/v1",
+    chatModel: "Qwen/Qwen2.5-VL-72B-Instruct",
+    supportsRealtime: false,
+    realtimeEnabled: false,
+    realtimeBaseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    realtimeModel: "qwen3-omni-flash-realtime",
+    realtimeVoice: "Cherry",
+  },
+  {
+    id: "minimax",
+    name: "MiniMax",
+    description: "MiniMax Open Platform 兼容接口。",
+    baseUrl: "https://api.minimax.chat/v1",
+    chatModel: "abab6.5s-chat",
+    supportsRealtime: false,
+    realtimeEnabled: false,
+    realtimeBaseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    realtimeModel: "qwen3-omni-flash-realtime",
+    realtimeVoice: "Cherry",
+  },
+  {
+    id: "openrouter",
+    name: "OpenRouter",
+    badge: "国际",
+    description: "多模型路由，可填任意 OpenRouter 模型。",
+    baseUrl: "https://openrouter.ai/api/v1",
+    chatModel: "qwen/qwen2.5-vl-72b-instruct",
+    supportsRealtime: false,
+    realtimeEnabled: false,
+    realtimeBaseUrl: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+    realtimeModel: "qwen3-omni-flash-realtime",
+    realtimeVoice: "Cherry",
+  },
+];
 
 function modelConfigToForm(config: ModelConfig): ModelConfigForm {
   return {
@@ -1969,8 +2460,17 @@ function modelConfigToForm(config: ModelConfig): ModelConfigForm {
 function keySourceLabel(config: ModelConfig | null) {
   if (!config) return "读取中";
   if (config.keySource === "user") return `用户密钥 ${config.keyPreview}`;
-  if (config.keySource === "environment") return "环境变量已配置";
-  return "尚未配置";
+  if (config.keySource === "environment") return "使用后端环境变量";
+  return "未配置";
+}
+
+function normalizeUrlForPreset(value: string) {
+  return value.trim().replace(/\/+$/, "");
+}
+
+function findMatchingPreset(form: ModelConfigForm | null) {
+  if (!form) return null;
+  return providerPresets.find((preset) => normalizeUrlForPreset(preset.baseUrl) === normalizeUrlForPreset(form.baseUrl)) ?? null;
 }
 
 function ApiKeyManagementView({ apiBaseUrl, token }: { apiBaseUrl: string; token: string }) {
@@ -1978,8 +2478,11 @@ function ApiKeyManagementView({ apiBaseUrl, token }: { apiBaseUrl: string; token
   const [form, setForm] = useState<ModelConfigForm | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const selectedPreset = useMemo(() => findMatchingPreset(form), [form]);
+  const realtimeConfigVisible = !selectedPreset || selectedPreset.supportsRealtime;
 
   const loadConfig = useCallback(async () => {
     setLoading(true);
@@ -1988,8 +2491,8 @@ function ApiKeyManagementView({ apiBaseUrl, token }: { apiBaseUrl: string; token
       const next = await fetchModelConfig(apiBaseUrl, token);
       setConfig(next);
       setForm(modelConfigToForm(next));
-    } catch (configError) {
-      setError(configError instanceof Error ? configError.message : "模型配置读取失败");
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "加载配置失败");
     } finally {
       setLoading(false);
     }
@@ -2003,42 +2506,44 @@ function ApiKeyManagementView({ apiBaseUrl, token }: { apiBaseUrl: string; token
     <Key extends keyof ModelConfigForm>(key: Key, value: ModelConfigForm[Key]) => {
       setForm((current) => (current ? { ...current, [key]: value } : current));
       setMessage("");
+      setError("");
     },
     [],
   );
 
-  const save = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!form) return;
-    setSaving(true);
-    setError("");
-    setMessage("");
-    try {
-      const payload: ModelConfigUpdate = {
-        baseUrl: form.baseUrl,
-        chatModel: form.chatModel,
-        realtimeEnabled: form.realtimeEnabled,
-        realtimeBaseUrl: form.realtimeBaseUrl,
-        realtimeModel: form.realtimeModel,
-        realtimeVoice: form.realtimeVoice,
-      };
-      if (form.apiKey.trim()) payload.apiKey = form.apiKey.trim();
-      const next = await updateModelConfig(apiBaseUrl, token, payload);
-      setConfig(next);
-      setForm(modelConfigToForm(next));
-      setMessage("模型配置已保存，下次启动会话时生效。");
-    } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "模型配置保存失败");
-    } finally {
-      setSaving(false);
-    }
-  };
+  const saveConfig = useCallback(
+    async (event: React.FormEvent) => {
+      event.preventDefault();
+      if (!form) return;
+      setSaving(true);
+      setError("");
+      try {
+        const payload: ModelConfigUpdate = {
+          baseUrl: form.baseUrl,
+          chatModel: form.chatModel,
+          realtimeEnabled: form.realtimeEnabled,
+          realtimeBaseUrl: form.realtimeBaseUrl,
+          realtimeModel: form.realtimeModel,
+          realtimeVoice: form.realtimeVoice,
+        };
+        if (form.apiKey.trim()) payload.apiKey = form.apiKey.trim();
+        const next = await updateModelConfig(apiBaseUrl, token, payload);
+        setConfig(next);
+        setForm(modelConfigToForm(next));
+        setMessage("模型配置已保存，新会话连接会使用最新配置。");
+      } catch (saveError) {
+        setError(saveError instanceof Error ? saveError.message : "保存配置失败");
+      } finally {
+        setSaving(false);
+      }
+    },
+    [apiBaseUrl, form, token],
+  );
 
-  const clearUserKey = async () => {
-    if (!form || !window.confirm("清除当前用户保存的 API Key？")) return;
-    setSaving(true);
+  const clearApiKey = useCallback(async () => {
+    if (!form) return;
+    setClearing(true);
     setError("");
-    setMessage("");
     try {
       const next = await updateModelConfig(apiBaseUrl, token, {
         ...form,
@@ -2047,173 +2552,244 @@ function ApiKeyManagementView({ apiBaseUrl, token }: { apiBaseUrl: string; token
       });
       setConfig(next);
       setForm(modelConfigToForm(next));
-      setMessage("用户 API Key 已清除，将回退到环境变量配置。");
+      setMessage("用户 API Key 已清除。");
     } catch (clearError) {
-      setError(clearError instanceof Error ? clearError.message : "API Key 清除失败");
+      setError(clearError instanceof Error ? clearError.message : "清除密钥失败");
     } finally {
-      setSaving(false);
+      setClearing(false);
     }
-  };
+  }, [apiBaseUrl, form, token]);
 
-  if (loading || !form) {
-    return (
-      <section className="max-w-4xl rounded-[2rem] border border-slate-200 bg-white p-7 shadow-soft">
-        <p className="text-sm font-bold text-slate-500">正在读取模型配置...</p>
-      </section>
-    );
-  }
+  const applyPreset = useCallback((preset: ProviderPreset) => {
+    setForm((current) => {
+      const keepApiKey = current?.apiKey ?? "";
+      return {
+        apiKey: keepApiKey,
+        baseUrl: preset.baseUrl,
+        chatModel: preset.chatModel,
+        realtimeEnabled: preset.realtimeEnabled,
+        realtimeBaseUrl: preset.realtimeBaseUrl,
+        realtimeModel: preset.realtimeModel,
+        realtimeVoice: preset.realtimeVoice,
+      };
+    });
+    setMessage(`已套用 ${preset.name} 预设，检查 API Key 后保存。`);
+    setError("");
+  }, []);
 
   return (
-    <section className="max-w-4xl rounded-[2rem] border border-slate-200 bg-white p-7 shadow-soft">
-      <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
+    <section className="mx-auto flex w-full max-w-6xl flex-1 flex-col pb-8">
+      <div className="mb-5 flex flex-wrap items-end justify-between gap-4">
         <div>
-          <div className="mb-3 inline-flex h-10 items-center gap-2 rounded-2xl bg-slate-100 px-3 text-sm font-black text-slate-700">
-            <KeyRound size={17} /> {keySourceLabel(config)}
-          </div>
-          <h2 className="text-2xl font-black">API Key 管理</h2>
+          <p className="text-xs font-black uppercase text-emerald-700">Model switchboard</p>
+          <h2 className="mt-1 text-3xl font-black text-slate-950">API Key 管理</h2>
           <p className="mt-2 max-w-2xl text-sm font-semibold leading-6 text-slate-500">
-            用户级配置会加密保存，并优先于服务端环境变量；已运行的会话不会被中途切换。
+            选择供应商预设后填入密钥；自定义 Base URL 和模型名仍可直接编辑。
           </p>
         </div>
-        <button
-          className="inline-flex h-10 items-center gap-2 rounded-2xl border border-slate-200 px-4 text-sm font-black text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-          disabled={saving}
-          onClick={() => void loadConfig()}
-          type="button"
-        >
-          <RefreshCw size={16} /> 刷新
-        </button>
+        <div className="min-w-[13rem] rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+          <span className="block text-xs font-black text-slate-400">当前密钥</span>
+          <strong className={cx("mt-1 block text-sm", config?.keyConfigured ? "text-emerald-700" : "text-rose-700")}>
+            {keySourceLabel(config)}
+          </strong>
+        </div>
       </div>
+      {loading && <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm font-bold text-slate-500">正在读取配置...</div>}
+      {!loading && form && (
+        <form className="grid min-h-0 gap-5 lg:grid-cols-[minmax(17rem,21rem)_minmax(0,1fr)]" onSubmit={saveConfig}>
+          <aside className="self-start rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h3 className="text-lg font-black text-slate-950">预设供应商</h3>
+              <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-black text-slate-500">
+                {selectedPreset?.name ?? "自定义"}
+              </span>
+            </div>
+            <div className="grid max-h-[calc(100vh-17rem)] gap-2 overflow-y-auto pr-1 max-lg:max-h-none max-lg:grid-cols-2 max-sm:grid-cols-1">
+              {providerPresets.map((preset) => {
+                const active = selectedPreset?.id === preset.id;
+                return (
+                  <button
+                    aria-pressed={active}
+                    className={cx(
+                      "group min-w-0 rounded-2xl border px-3 py-2.5 text-left transition focus:outline-none focus:ring-2 focus:ring-emerald-500",
+                      active
+                        ? "border-emerald-700 bg-emerald-700 text-white shadow-[0_12px_30px_rgba(4,120,87,0.18)]"
+                        : "border-slate-200 bg-slate-50 text-slate-700 hover:border-slate-300 hover:bg-white",
+                    )}
+                    key={preset.id}
+                    onClick={() => applyPreset(preset)}
+                    type="button"
+                    >
+                      <span className="flex min-w-0 items-center justify-between gap-3">
+                      <strong className="truncate text-[15px] font-black">{preset.name}</strong>
+                      {preset.badge && (
+                        <span
+                          className={cx(
+                            "shrink-0 rounded-full px-2 py-0.5 text-[11px] font-black",
+                            active ? "bg-white/20 text-white" : "bg-amber-100 text-amber-700",
+                          )}
+                        >
+                          {preset.badge}
+                        </span>
+                      )}
+                    </span>
+                    <span className={cx("mt-1 block truncate text-xs font-semibold", active ? "text-emerald-50" : "text-slate-500")}>
+                      {preset.description}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </aside>
 
-      <form className="grid gap-5" onSubmit={save}>
-        <label className="grid gap-2 text-sm font-bold text-slate-600">
-          API Key
-          <input
-            className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400"
-            onChange={(event) => updateForm("apiKey", event.target.value)}
-            placeholder={config?.keyConfigured ? "留空则保留当前密钥" : "输入供应商 API Key"}
-            type="password"
-            value={form.apiKey}
-          />
-        </label>
+          <div className="min-w-0 rounded-3xl border border-slate-200 bg-white shadow-sm">
+            <div className="border-b border-slate-100 px-5 py-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <h3 className="truncate text-lg font-black text-slate-950">
+                    {selectedPreset ? selectedPreset.name : "自定义配置"}
+                  </h3>
+                  <p className="mt-1 text-xs font-semibold text-slate-500">当前会话保持不变，新建或重连后使用保存的配置。</p>
+                </div>
+                {realtimeConfigVisible ? (
+                  <label className="flex h-10 shrink-0 items-center gap-3 rounded-2xl bg-slate-100 px-3 text-sm font-black text-slate-700">
+                    Realtime
+                    <input
+                      checked={form.realtimeEnabled}
+                      className="h-5 w-5 accent-emerald-700"
+                      disabled={Boolean(selectedPreset && !selectedPreset.supportsRealtime)}
+                      onChange={(event) => updateForm("realtimeEnabled", event.target.checked)}
+                      type="checkbox"
+                    />
+                  </label>
+                ) : (
+                  <span className="h-10 shrink-0 rounded-2xl bg-slate-100 px-3 pt-2.5 text-sm font-black text-slate-500">
+                    Chat / Vision
+                  </span>
+                )}
+              </div>
+            </div>
 
-        <div className="grid gap-4 md:grid-cols-2">
-          <label className="grid gap-2 text-sm font-bold text-slate-600">
-            Chat Base URL
-            <input
-              className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400"
-              onChange={(event) => updateForm("baseUrl", event.target.value)}
-              required
-              value={form.baseUrl}
-            />
-          </label>
-          <label className="grid gap-2 text-sm font-bold text-slate-600">
-            Chat / Vision 模型
-            <input
-              className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400"
-              onChange={(event) => updateForm("chatModel", event.target.value)}
-              required
-              value={form.chatModel}
-            />
-          </label>
-          <label className="grid gap-2 text-sm font-bold text-slate-600">
-            Realtime Base URL
-            <input
-              className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400 disabled:opacity-50"
-              disabled={!form.realtimeEnabled}
-              onChange={(event) => updateForm("realtimeBaseUrl", event.target.value)}
-              required
-              value={form.realtimeBaseUrl}
-            />
-          </label>
-          <label className="grid gap-2 text-sm font-bold text-slate-600">
-            Realtime 模型
-            <input
-              className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400 disabled:opacity-50"
-              disabled={!form.realtimeEnabled}
-              onChange={(event) => updateForm("realtimeModel", event.target.value)}
-              required
-              value={form.realtimeModel}
-            />
-          </label>
-        </div>
+            <div className="grid gap-4 px-5 py-5">
+              <label className="grid min-w-0 gap-2 text-sm font-bold text-slate-600">
+                API Key
+                <input
+                  autoComplete="off"
+                  className="h-12 min-w-0 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none transition focus:border-emerald-600 focus:bg-white"
+                  onChange={(event) => updateForm("apiKey", event.target.value)}
+                  placeholder={config?.keyConfigured ? "留空表示保留当前密钥" : "输入模型服务 API Key"}
+                  type="password"
+                  value={form.apiKey}
+                />
+              </label>
 
-        <div className="grid gap-4 rounded-3xl bg-slate-50 p-4 md:grid-cols-[1fr_1fr]">
-          <label className="flex items-center gap-3 text-sm font-black text-slate-700">
-            <input
-              checked={form.realtimeEnabled}
-              className="h-5 w-5 accent-slate-950"
-              onChange={(event) => updateForm("realtimeEnabled", event.target.checked)}
-              type="checkbox"
-            />
-            启用 Realtime 音频模型
-          </label>
-          <label className="grid gap-2 text-sm font-bold text-slate-600">
-            Realtime 音色
-            <select
-              className="h-11 rounded-2xl border border-slate-200 bg-white px-4 font-semibold text-slate-900 outline-none focus:border-cyan-400"
-              onChange={(event) => updateForm("realtimeVoice", event.target.value)}
-              value={form.realtimeVoice}
-            >
-              {realtimeVoices.map((voice) => (
-                <option key={voice} value={voice}>
-                  {voice}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
+              <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+                <label className="grid min-w-0 gap-2 text-sm font-bold text-slate-600">
+                  Base URL
+                  <input
+                    className="h-12 min-w-0 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none transition focus:border-emerald-600 focus:bg-white"
+                    onChange={(event) => updateForm("baseUrl", event.target.value)}
+                    required
+                    value={form.baseUrl}
+                  />
+                </label>
+                <label className="grid min-w-0 gap-2 text-sm font-bold text-slate-600">
+                  对话 / 视觉模型
+                  <input
+                    className="h-12 min-w-0 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none transition focus:border-emerald-600 focus:bg-white"
+                    onChange={(event) => updateForm("chatModel", event.target.value)}
+                    required
+                    value={form.chatModel}
+                  />
+                </label>
+              </div>
 
-        {message && <p className="rounded-2xl bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-700">{message}</p>}
-        {error && <p className="rounded-2xl bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{error}</p>}
+              {realtimeConfigVisible && form.realtimeEnabled ? (
+                <>
+                  <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+                    <label className="grid min-w-0 gap-2 text-sm font-bold text-slate-600">
+                      Realtime Base URL
+                      <input
+                        className="h-12 min-w-0 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none transition focus:border-emerald-600 focus:bg-white"
+                        onChange={(event) => updateForm("realtimeBaseUrl", event.target.value)}
+                        required
+                        value={form.realtimeBaseUrl}
+                      />
+                    </label>
+                    <label className="grid min-w-0 gap-2 text-sm font-bold text-slate-600">
+                      Realtime 模型
+                      <input
+                        className="h-12 min-w-0 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none transition focus:border-emerald-600 focus:bg-white"
+                        onChange={(event) => updateForm("realtimeModel", event.target.value)}
+                        required
+                        value={form.realtimeModel}
+                      />
+                    </label>
+                  </div>
 
-        <div className="flex flex-wrap justify-end gap-3">
-          <button
-            className="h-11 rounded-2xl border border-slate-200 px-4 text-sm font-black text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-            disabled={saving || config?.keySource !== "user"}
-            onClick={() => void clearUserKey()}
-            type="button"
-          >
-            清除用户密钥
-          </button>
-          <button className="h-11 rounded-2xl bg-slate-950 px-5 text-sm font-black text-white disabled:opacity-50" disabled={saving} type="submit">
-            {saving ? "保存中..." : "保存配置"}
-          </button>
-        </div>
-      </form>
+                  <label className="grid min-w-0 gap-2 text-sm font-bold text-slate-600">
+                    默认音色
+                    <input
+                      className="h-12 min-w-0 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none transition focus:border-emerald-600 focus:bg-white"
+                      onChange={(event) => updateForm("realtimeVoice", event.target.value)}
+                      required
+                      value={form.realtimeVoice}
+                    />
+                  </label>
+                </>
+              ) : null}
+
+              {message && <div className="rounded-2xl bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-800">{message}</div>}
+              {error && <div className="rounded-2xl bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{error}</div>}
+            </div>
+
+            <div className="sticky bottom-0 flex flex-wrap gap-3 border-t border-slate-100 bg-white/95 px-5 py-4 backdrop-blur">
+              <button
+                className="h-11 rounded-2xl bg-emerald-700 px-5 text-sm font-black text-white hover:bg-emerald-800 disabled:opacity-60"
+                disabled={saving || clearing}
+                type="submit"
+              >
+                {saving ? "保存中..." : "保存配置"}
+              </button>
+              <button
+                className="h-11 rounded-2xl bg-slate-100 px-5 text-sm font-black text-slate-700 hover:bg-slate-200 disabled:opacity-60"
+                disabled={saving || clearing || config?.keySource !== "user"}
+                onClick={() => void clearApiKey()}
+                type="button"
+              >
+                {clearing ? "清除中..." : "清除用户密钥"}
+              </button>
+            </div>
+          </div>
+        </form>
+      )}
     </section>
   );
 }
 
 const usageWindows = [7, 30, 90] as const;
+const RECENT_EVENTS_PAGE_SIZE = 6;
 const modalityLabels: Record<string, string> = {
   llm: "LLM 文本",
   vlm: "VLM 视觉",
-  stt: "STT 语音",
-  tts: "TTS 语音",
+  stt: "STT 语音识别",
+  tts: "TTS 语音合成",
 };
 
-function CostStation({
+function UsageStatsView({
   apiBaseUrl,
   cost,
-  connectionState,
-  permissionStatus,
-  asrStatus,
-  realtimeAudio,
   token,
 }: {
   apiBaseUrl: string;
   cost: CostSnapshot;
-  connectionState: string;
-  permissionStatus: string;
-  asrStatus: string;
-  realtimeAudio: boolean;
   token: string;
 }) {
   const [days, setDays] = useState<(typeof usageWindows)[number]>(7);
   const [stats, setStats] = useState<UsageStats | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [recentPage, setRecentPage] = useState(0);
 
   const loadStats = useCallback(async () => {
     setLoading(true);
@@ -2231,115 +2807,172 @@ function CostStation({
     void loadStats();
   }, [loadStats]);
 
+  useEffect(() => {
+    setRecentPage(0);
+  }, [days]);
+
   const totals = stats?.totals ?? emptyUsageTotals();
   const actualTokens = totals.promptTokens + totals.completionTokens;
   const estimatedTokens = totals.estimatedPromptTokens + totals.estimatedCompletionTokens;
   const currentInputTokens = cost.llmInputTokens || cost.llmInputTokensEst;
   const currentOutputTokens = cost.llmOutputTokens || cost.llmOutputTokensEst;
+  const recentEvents = stats?.recentEvents ?? [];
+  const recentPageCount = Math.max(1, Math.ceil(recentEvents.length / RECENT_EVENTS_PAGE_SIZE));
+  const safeRecentPage = Math.min(recentPage, recentPageCount - 1);
+  const visibleRecentEvents = recentEvents.slice(
+    safeRecentPage * RECENT_EVENTS_PAGE_SIZE,
+    safeRecentPage * RECENT_EVENTS_PAGE_SIZE + RECENT_EVENTS_PAGE_SIZE,
+  );
 
   return (
-    <section className="space-y-6">
-      <div className="rounded-[2rem] bg-slate-950 p-8 text-white shadow-soft">
-        <span className="text-sm font-bold text-cyan-300">Gateway & Backend</span>
-        <div className="mt-2 flex items-end justify-between gap-4">
-          <div>
-            <h2 className="text-3xl font-black">模型消耗统计</h2>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">
-              当前会话实时快照与数据库聚合统计并行展示，方便复盘多模态调用成本。
-            </p>
+    <section className="min-h-full bg-white px-1 py-1 text-slate-950">
+      <div className="mx-auto flex max-w-7xl flex-col gap-5">
+        <div className="grid gap-4 border-b border-slate-300 pb-5 xl:grid-cols-[1.35fr_0.65fr]">
+          <div className="min-w-0">
+            <h2 className="max-w-4xl text-3xl font-black leading-tight tracking-normal text-slate-950 md:text-5xl">
+              模型消耗统计
+            </h2>
           </div>
-          <strong className="text-6xl font-black">{formatCompact(totals.estimatedUnits || cost.estimatedUnits)}</strong>
+          <div className="grid content-end gap-3">
+            <div className="flex flex-wrap justify-start gap-2 xl:justify-end">
+              {usageWindows.map((windowDays) => (
+                <button
+                  className={cx(
+                    "h-9 rounded-lg border px-3 text-sm font-black transition",
+                    days === windowDays
+                      ? "border-slate-950 bg-slate-950 text-white"
+                      : "border-slate-300 bg-white text-slate-700 hover:border-slate-500",
+                  )}
+                  key={windowDays}
+                  onClick={() => setDays(windowDays)}
+                  type="button"
+                >
+                  {windowDays} 天
+                </button>
+              ))}
+              <button
+                className="grid h-9 w-9 place-items-center rounded-lg border border-slate-300 bg-white text-slate-700 hover:border-slate-500 disabled:opacity-50"
+                disabled={loading}
+                onClick={() => void loadStats()}
+                title="刷新统计"
+                type="button"
+              >
+                <RefreshCw className={cx(loading && "animate-spin")} size={16} />
+              </button>
+            </div>
+            <div className="text-left text-xs font-bold text-slate-500 xl:text-right">
+              {stats ? `统计至 ${dateTimeLabel(stats.generatedAt)}` : "等待统计数据"}
+            </div>
+          </div>
         </div>
-      </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap gap-2">
-          {usageWindows.map((windowDays) => (
-            <button
-              className={cx(
-                "h-10 rounded-2xl border px-4 text-sm font-black transition",
-                days === windowDays
-                  ? "border-slate-950 bg-slate-950 text-white"
-                  : "border-slate-200 bg-white text-slate-600 hover:border-slate-400",
+        {error && <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{error}</div>}
+
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <UsageKpi icon={<Gauge size={19} />} label="估算计费单位" value={formatCompact(totals.estimatedUnits)} accent="bg-lime-300" />
+          <UsageKpi icon={<BarChart3 size={19} />} label="真实 token" value={formatCompact(actualTokens)} subValue={`估算 ${formatCompact(estimatedTokens)}`} accent="bg-cyan-300" />
+          <UsageKpi icon={<Timer size={19} />} label="STT 音频" value={formatDuration(totals.audioMs)} subValue={`有效语音 ${formatDuration(totals.speechMs)}`} accent="bg-amber-300" />
+          <UsageKpi icon={<Volume2 size={19} />} label="TTS 输出" value={`${formatCompact(totals.ttsChars)} 字`} subValue={`音频 ${formatDuration(totals.ttsAudioMs)}`} accent="bg-rose-300" />
+        </div>
+
+        <div className="grid gap-5 xl:grid-cols-[0.92fr_1.08fr]">
+          <section className="rounded-lg border border-slate-300 bg-white">
+            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+              <h3 className="text-sm font-black text-slate-900">当前会话实时快照</h3>
+              <span className="rounded bg-slate-100 px-2 py-1 text-xs font-black text-slate-500">{formatCompact(cost.estimatedUnits)} units</span>
+            </div>
+            <div className="grid gap-0 divide-y divide-slate-100">
+              <UsageLine icon={<Mic size={16} />} label="STT 上传音频" value={formatSeconds(cost.audioSeconds)} detail={`有效语音 ${formatSeconds(cost.speechSeconds)} · ${cost.audioChunks} 帧`} />
+              <UsageLine icon={<Eye size={16} />} label="VLM 图片输入" value={`${cost.visionFrames} 帧`} detail={`缓存命中 ${cost.visionCacheHits}`} />
+              <UsageLine icon={<Activity size={16} />} label="LLM token" value={formatCompact(currentInputTokens + currentOutputTokens)} detail={`输入 ${formatCompact(currentInputTokens)} · 输出 ${formatCompact(currentOutputTokens)}`} />
+              <UsageLine icon={<FileText size={16} />} label="TTS 输出" value={`${formatCompact(cost.ttsChars)} 字`} detail={`音频 ${formatSeconds(cost.ttsAudioSeconds ?? 0)} · 打断 ${cost.interruptions} 次`} />
+            </div>
+          </section>
+
+          <section className="rounded-lg border border-slate-300 bg-white">
+            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+              <h3 className="text-sm font-black text-slate-900">模态拆分</h3>
+              <span className="text-xs font-bold text-slate-500">{totals.eventCount} 条计量事件</span>
+            </div>
+            <div className="grid gap-3 p-4">
+              {stats?.modalities.length ? (
+                stats.modalities.map((bucket) => (
+                  <ModalityUsageBar key={bucket.modality} bucket={bucket} maxUnits={maxBucketUnits(stats.modalities)} />
+                ))
+              ) : (
+                <EmptyUsageState text="还没有聚合事件。开始一次对话后，后台队列会写入新的计量事件。" />
               )}
-              key={windowDays}
-              onClick={() => setDays(windowDays)}
-              type="button"
-            >
-              {windowDays} 天
-            </button>
-          ))}
+            </div>
+          </section>
         </div>
-        <button
-          className="inline-flex h-10 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-black text-slate-700 hover:border-slate-400 disabled:opacity-50"
-          disabled={loading}
-          onClick={() => void loadStats()}
-          type="button"
-        >
-          <RefreshCw size={16} /> {loading ? "刷新中" : "刷新"}
-        </button>
-      </div>
-      {error && <p className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{error}</p>}
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <Metric label="聚合计费单位" value={formatCompact(totals.estimatedUnits)} />
-        <Metric label="真实 token" value={formatCompact(actualTokens)} />
-        <Metric label="估算 token" value={formatCompact(estimatedTokens)} />
-        <Metric label="事件数" value={formatCompact(totals.eventCount)} />
-      </div>
+        <div className="grid gap-5 xl:grid-cols-[1fr_0.8fr]">
+          <section className="rounded-lg border border-slate-300 bg-white">
+            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+              <h3 className="text-sm font-black text-slate-900">每日趋势</h3>
+              <span className="text-xs font-bold text-slate-500">{days} 天窗口</span>
+            </div>
+            <DailyUsageChart daily={stats?.daily ?? []} />
+          </section>
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        <Metric label="音频总时长" value={`${cost.audioSeconds}s`} />
-        <Metric label="有效语音" value={`${cost.speechSeconds}s`} />
-        <Metric label="音频帧" value={cost.audioChunks.toString()} />
-        <Metric label="视觉调用" value={cost.visionFrames.toString()} />
-        <Metric label="缓存命中" value={cost.visionCacheHits.toString()} />
-        <Metric label="输入 token" value={formatCompact(currentInputTokens)} />
-        <Metric label="输出 token" value={formatCompact(currentOutputTokens)} />
-        <Metric label="TTS 字符" value={cost.ttsChars.toString()} />
-        <Metric label="打断次数" value={cost.interruptions.toString()} />
-      </div>
-
-      <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
-        <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
-          <h3 className="mb-4 text-sm font-black text-slate-900">按模态聚合</h3>
-          <div className="space-y-4">
-            {stats?.modalities.length ? (
-              stats.modalities.map((bucket) => <ModalityUsageBar bucket={bucket} key={bucket.modality} maxUnits={maxBucketUnits(stats.modalities)} />)
-            ) : (
-              <EmptyUsageState text="暂无聚合事件。完成一次对话后这里会出现 STT、VLM、LLM 与 TTS 记录。" />
+          <section className="rounded-lg border border-slate-300 bg-white">
+            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+              <h3 className="text-sm font-black text-slate-900">最近事件</h3>
+              <div className="flex items-center gap-3">
+                <span className="text-xs font-bold text-slate-500">
+                  {recentEvents.length ? `${safeRecentPage + 1} / ${recentPageCount}` : "0 / 0"}
+                </span>
+                <Database size={16} className="text-slate-400" />
+              </div>
+            </div>
+            <div className="divide-y divide-slate-100">
+              {visibleRecentEvents.length ? (
+                visibleRecentEvents.map((event, index) => <RecentUsageEvent event={event} key={`${event.createdAt}-${safeRecentPage}-${index}`} />)
+              ) : (
+                <EmptyUsageState text="暂无事件记录。" />
+              )}
+            </div>
+            {recentEvents.length > RECENT_EVENTS_PAGE_SIZE && (
+              <div className="flex items-center justify-between border-t border-slate-100 px-4 py-3">
+                <button
+                  className="h-8 rounded-lg border border-slate-200 px-3 text-xs font-black text-slate-600 transition hover:border-slate-400 disabled:cursor-not-allowed disabled:opacity-40"
+                  disabled={safeRecentPage === 0}
+                  onClick={() => setRecentPage((page) => Math.max(0, page - 1))}
+                  type="button"
+                >
+                  上一页
+                </button>
+                <span className="text-xs font-bold text-slate-500">
+                  {safeRecentPage * RECENT_EVENTS_PAGE_SIZE + 1}-{Math.min((safeRecentPage + 1) * RECENT_EVENTS_PAGE_SIZE, recentEvents.length)} / {recentEvents.length}
+                </span>
+                <button
+                  className="h-8 rounded-lg border border-slate-200 px-3 text-xs font-black text-slate-600 transition hover:border-slate-400 disabled:cursor-not-allowed disabled:opacity-40"
+                  disabled={safeRecentPage >= recentPageCount - 1}
+                  onClick={() => setRecentPage((page) => Math.min(recentPageCount - 1, page + 1))}
+                  type="button"
+                >
+                  下一页
+                </button>
+              </div>
             )}
+          </section>
+        </div>
+
+        <section className="rounded-lg border border-slate-300 bg-white">
+          <div className="grid grid-cols-[1.4fr_0.8fr_0.8fr_0.8fr] gap-3 border-b border-slate-200 px-4 py-3 text-xs font-black uppercase tracking-[0.12em] text-slate-500 max-md:hidden">
+            <span>会话</span>
+            <span>token</span>
+            <span>音频</span>
+            <span>单位</span>
           </div>
-        </section>
-        <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
-          <h3 className="mb-4 text-sm font-black text-slate-900">最近事件</h3>
           <div className="divide-y divide-slate-100">
-            {stats?.recentEvents.length ? (
-              stats.recentEvents.slice(0, 6).map((event, index) => <RecentUsageEvent event={event} key={`${event.createdAt}-${index}`} />)
+            {stats?.conversations.length ? (
+              stats.conversations.map((conversation) => <ConversationUsageRow conversation={conversation} key={conversation.id} />)
             ) : (
-              <EmptyUsageState text="暂无事件记录。" />
+              <EmptyUsageState text="这个时间窗口内还没有会话用量。" />
             )}
           </div>
         </section>
-      </div>
-
-      <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
-        <h3 className="mb-4 text-sm font-black text-slate-900">会话用量</h3>
-        <div className="divide-y divide-slate-100">
-          {stats?.conversations.length ? (
-            stats.conversations.map((conversation) => <ConversationUsageRow conversation={conversation} key={conversation.id} />)
-          ) : (
-            <EmptyUsageState text="这个时间窗口内还没有会话用量。" />
-          )}
-        </div>
-      </section>
-
-      <div className="grid gap-3 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm md:grid-cols-2">
-        <PipelineItem icon={<Wifi size={16} />} label={`Gateway：${connectionState}`} />
-        <PipelineItem icon={<Camera size={16} />} label={`权限：${permissionStatus}`} />
-        <PipelineItem icon={<Mic size={16} />} label={`ASR：${asrStatus}`} />
-        <PipelineItem icon={<Eye size={16} />} label="Direct Omni/VL" />
-        <PipelineItem icon={<Volume2 size={16} />} label={realtimeAudio ? "Qwen Realtime Audio" : "Browser TTS"} />
       </div>
     </section>
   );
@@ -2363,19 +2996,42 @@ function emptyUsageTotals(): UsageTotals {
   };
 }
 
-function formatCompact(value: number) {
-  return Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1, notation: Math.abs(value) >= 10000 ? "compact" : "standard" }).format(value);
+function UsageKpi({
+  accent,
+  icon,
+  label,
+  subValue,
+  value,
+}: {
+  accent: string;
+  icon: React.ReactNode;
+  label: string;
+  subValue?: string;
+  value: string;
+}) {
+  return (
+    <article className="rounded-lg border border-slate-300 bg-white p-4">
+      <div className="mb-5 flex items-center justify-between">
+        <span className={cx("grid h-8 w-8 place-items-center rounded-lg text-slate-950", accent)}>{icon}</span>
+        <span className="text-xs font-black uppercase tracking-[0.16em] text-slate-400">{label}</span>
+      </div>
+      <strong className="block text-3xl font-black leading-none text-slate-950">{value}</strong>
+      {subValue && <span className="mt-2 block text-xs font-bold text-slate-500">{subValue}</span>}
+    </article>
+  );
 }
 
-function formatDuration(ms: number) {
-  if (ms < 1000) return `${ms}ms`;
-  const seconds = ms / 1000;
-  if (seconds < 60) return `${seconds.toFixed(1)}s`;
-  return `${(seconds / 60).toFixed(1)}min`;
-}
-
-function maxBucketUnits(buckets: UsageBucket[]) {
-  return Math.max(0, ...buckets.map((bucket) => bucket.estimatedUnits));
+function UsageLine({ detail, icon, label, value }: { detail: string; icon: React.ReactNode; label: string; value: string }) {
+  return (
+    <div className="grid grid-cols-[28px_1fr_auto] items-center gap-3 px-4 py-3">
+      <span className="grid h-7 w-7 place-items-center rounded bg-slate-100 text-slate-600">{icon}</span>
+      <span className="min-w-0">
+        <span className="block text-sm font-black text-slate-900">{label}</span>
+        <span className="block truncate text-xs font-semibold text-slate-500">{detail}</span>
+      </span>
+      <strong className="text-right text-lg font-black text-slate-950">{value}</strong>
+    </div>
+  );
 }
 
 function ModalityUsageBar({ bucket, maxUnits }: { bucket: UsageBucket; maxUnits: number }) {
@@ -2399,10 +3055,30 @@ function ModalityUsageBar({ bucket, maxUnits }: { bucket: UsageBucket; maxUnits:
   );
 }
 
+function DailyUsageChart({ daily }: { daily: UsageBucket[] }) {
+  if (!daily.length) return <EmptyUsageState text="暂无每日趋势。" />;
+  const maxUnits = maxBucketUnits(daily);
+  return (
+    <div className="flex h-64 items-end gap-2 px-4 pb-4 pt-6">
+      {daily.map((day) => {
+        const height = maxUnits > 0 ? Math.max(8, Math.round((day.estimatedUnits / maxUnits) * 100)) : 0;
+        return (
+          <div className="flex min-w-0 flex-1 flex-col items-center gap-2" key={day.day}>
+            <div className="flex h-48 w-full items-end rounded bg-slate-100">
+              <div className="w-full rounded bg-cyan-500" style={{ height: `${height}%` }} title={`${day.day}: ${day.estimatedUnits} units`} />
+            </div>
+            <span className="max-w-full truncate text-[11px] font-bold text-slate-500">{day.day?.slice(5)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function RecentUsageEvent({ event }: { event: UsageEvent }) {
   const tokens = event.promptTokens + event.completionTokens || event.estimatedPromptTokens + event.estimatedCompletionTokens;
   return (
-    <div className="grid grid-cols-[1fr_auto] gap-3 py-3">
+    <div className="grid grid-cols-[1fr_auto] gap-3 px-4 py-3">
       <span className="min-w-0">
         <span className="block truncate text-sm font-black text-slate-900">{modalityLabels[event.modality] ?? event.modality}</span>
         <span className="block truncate text-xs font-semibold text-slate-500">
@@ -2420,90 +3096,47 @@ function RecentUsageEvent({ event }: { event: UsageEvent }) {
 function ConversationUsageRow({ conversation }: { conversation: UsageBucket }) {
   const tokens = conversation.promptTokens + conversation.completionTokens || conversation.estimatedPromptTokens + conversation.estimatedCompletionTokens;
   return (
-    <div className="grid gap-2 py-3 text-sm md:grid-cols-[1.4fr_0.8fr_0.8fr_0.8fr] md:items-center">
+    <div className="grid gap-2 px-4 py-3 text-sm md:grid-cols-[1.4fr_0.8fr_0.8fr_0.8fr] md:items-center">
       <span className="min-w-0">
         <span className="block truncate font-black text-slate-950">{conversation.title ?? "未命名会话"}</span>
-        <span className="block text-xs font-semibold text-slate-500">{conversation.lastUsedAt ? timeLabel(conversation.lastUsedAt) : "暂无时间"}</span>
+        <span className="block text-xs font-semibold text-slate-500">{conversation.lastUsedAt ? dateTimeLabel(conversation.lastUsedAt) : "暂无时间"}</span>
       </span>
-      <span className="font-bold text-slate-600">事件 {formatCompact(conversation.eventCount)}</span>
-      <span className="font-bold text-slate-600">Token {formatCompact(tokens)}</span>
-      <span className="font-black text-slate-950">{formatCompact(conversation.estimatedUnits)} units</span>
+      <span className="font-bold text-slate-700">{formatCompact(tokens)}</span>
+      <span className="font-bold text-slate-700">{formatDuration(conversation.audioMs)}</span>
+      <span className="font-black text-slate-950">{formatCompact(conversation.estimatedUnits)}</span>
     </div>
   );
 }
 
 function EmptyUsageState({ text }: { text: string }) {
-  return <p className="rounded-2xl bg-slate-50 px-4 py-6 text-sm font-bold text-slate-500">{text}</p>;
+  return <p className="px-4 py-6 text-sm font-bold text-slate-500">{text}</p>;
 }
 
-function SettingsView({
-  gatewayUrl,
-  permissionStatus,
-  asrStatus,
-  selectedVoice,
-  setSelectedVoice,
-  user,
-  onLogout,
-}: {
-  gatewayUrl: string;
-  permissionStatus: string;
-  asrStatus: string;
-  selectedVoice: RealtimeVoice;
-  setSelectedVoice: (voice: RealtimeVoice) => void;
-  user: AuthSession["user"];
-  onLogout: () => Promise<void>;
-}) {
-  return (
-    <section className="max-w-3xl rounded-[2rem] border border-slate-200 bg-white p-7 shadow-soft">
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <h2 className="text-2xl font-black">用户设置</h2>
-          <p className="mt-1 text-sm font-semibold text-slate-500">当前账号：{user.username}</p>
-        </div>
-        <button className="rounded-2xl bg-slate-950 px-4 py-2 text-sm font-bold text-white" onClick={() => void onLogout()}>
-          退出登录
-        </button>
-      </div>
-      <div className="mt-6 grid gap-4">
-        <ReadonlyField label="用户 ID" value={user.id} />
-        <ReadonlyField label="Gateway 地址" value={gatewayUrl} />
-        <ReadonlyField label="权限状态" value={permissionStatus} />
-        <ReadonlyField label="语音识别" value={asrStatus} />
-        <div className="rounded-2xl bg-slate-50 px-4 py-3">
-          <span className="text-xs font-black text-slate-400">Realtime 音色</span>
-          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {realtimeVoices.map((voice) => (
-              <button
-                key={voice}
-                className={cx(
-                  "h-10 rounded-2xl text-sm font-black transition",
-                  selectedVoice === voice ? "bg-slate-950 text-white" : "bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-100",
-                )}
-                onClick={() => setSelectedVoice(voice)}
-                type="button"
-              >
-                {voice}
-              </button>
-            ))}
-          </div>
-          <p className="mt-2 text-xs font-semibold text-slate-500">音色会保存到本机，并在会话启动或切换时同步给 Realtime Gateway。</p>
-        </div>
-      </div>
-    </section>
-  );
+function maxBucketUnits(buckets: UsageBucket[]) {
+  return Math.max(0, ...buckets.map((bucket) => bucket.estimatedUnits));
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
-      <span className="text-sm font-bold text-slate-500">{label}</span>
-      <strong className="mt-3 block text-3xl font-black text-slate-950">{value}</strong>
-    </div>
-  );
+function formatCompact(value: number) {
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: value >= 10 ? 0 : 2 }).format(value);
 }
 
-function PipelineItem({ icon, label }: { icon: React.ReactNode; label: string }) {
-  return <div className="flex min-h-12 items-center gap-3 rounded-2xl bg-slate-100 px-4 text-sm font-black text-slate-700">{icon}{label}</div>;
+function formatDuration(ms: number) {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+  return `${(ms / 60_000).toFixed(1)}min`;
+}
+
+function formatSeconds(seconds: number) {
+  return formatDuration(Math.round(seconds * 1000));
+}
+
+function dateTimeLabel(timestamp: number) {
+  return new Date(timestamp).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function ReadonlyField({ label, value }: { label: string; value: string }) {
@@ -2513,8 +3146,4 @@ function ReadonlyField({ label, value }: { label: string; value: string }) {
       <input className="h-12 rounded-2xl border border-slate-200 bg-slate-50 px-4 font-semibold text-slate-900 outline-none" value={value} readOnly />
     </label>
   );
-}
-
-function StatusPill({ label, active }: { label: string; active: boolean }) {
-  return <span className={cx("rounded-full px-4 py-2 text-sm font-black", active ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-500")}>{label}</span>;
 }

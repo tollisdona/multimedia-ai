@@ -70,6 +70,7 @@ export interface UsageBucket extends UsageTotals {
   id?: string;
   title?: string;
   modality?: string;
+  day?: string;
   lastUsedAt?: number;
 }
 
@@ -89,6 +90,7 @@ export interface UsageStats {
   totals: UsageTotals;
   modalities: UsageBucket[];
   conversations: UsageBucket[];
+  daily: UsageBucket[];
   recentEvents: UsageEvent[];
 }
 
