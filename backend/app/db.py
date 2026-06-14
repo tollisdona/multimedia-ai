@@ -94,6 +94,34 @@ def init_db() -> None:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                modality TEXT NOT NULL,
+                metric_type TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_completion_tokens INTEGER NOT NULL DEFAULT 0,
+                audio_ms INTEGER NOT NULL DEFAULT 0,
+                speech_ms INTEGER NOT NULL DEFAULT 0,
+                audio_chunks INTEGER NOT NULL DEFAULT 0,
+                tts_chars INTEGER NOT NULL DEFAULT 0,
+                tts_audio_ms INTEGER NOT NULL DEFAULT 0,
+                image_count INTEGER NOT NULL DEFAULT 0,
+                event_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(conversation_id) REFERENCES conversations(id),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_conversations_user_updated
             ON conversations(user_id, updated_at DESC)
             """
@@ -108,6 +136,18 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_cost_snapshots_conversation_created
             ON cost_snapshots(conversation_id, user_id, created_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_usage_events_user_created
+            ON usage_events(user_id, created_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_usage_events_conversation_created
+            ON usage_events(conversation_id, user_id, created_at DESC)
             """
         )
 
@@ -331,6 +371,10 @@ def delete_conversation(user_id: str, conversation_id: str) -> bool:
             (conversation_id, user_id),
         )
         connection.execute(
+            "DELETE FROM usage_events WHERE conversation_id = ? AND user_id = ?",
+            (conversation_id, user_id),
+        )
+        connection.execute(
             "DELETE FROM messages WHERE conversation_id = ? AND user_id = ?",
             (conversation_id, user_id),
         )
@@ -415,6 +459,198 @@ def save_cost_snapshot(user_id: str, conversation_id: str, snapshot: dict[str, A
             "UPDATE conversations SET latest_cost_json = ?, updated_at = ? WHERE id = ? AND user_id = ?",
             (snapshot_json, now, conversation_id, user_id),
         )
+
+
+def enqueue_usage_event(
+    user_id: str,
+    conversation_id: str,
+    *,
+    provider: str,
+    model: str,
+    modality: str,
+    metric_type: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    estimated_prompt_tokens: int = 0,
+    estimated_completion_tokens: int = 0,
+    audio_ms: int = 0,
+    speech_ms: int = 0,
+    audio_chunks: int = 0,
+    tts_chars: int = 0,
+    tts_audio_ms: int = 0,
+    image_count: int = 0,
+    details: dict[str, Any] | None = None,
+) -> None:
+    event_payload = {
+        "id": str(uuid4()),
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+        "provider": provider,
+        "model": model,
+        "modality": modality,
+        "metric_type": metric_type,
+        "prompt_tokens": max(0, int(prompt_tokens)),
+        "completion_tokens": max(0, int(completion_tokens)),
+        "estimated_prompt_tokens": max(0, int(estimated_prompt_tokens)),
+        "estimated_completion_tokens": max(0, int(estimated_completion_tokens)),
+        "audio_ms": max(0, int(audio_ms)),
+        "speech_ms": max(0, int(speech_ms)),
+        "audio_chunks": max(0, int(audio_chunks)),
+        "tts_chars": max(0, int(tts_chars)),
+        "tts_audio_ms": max(0, int(tts_audio_ms)),
+        "image_count": max(0, int(image_count)),
+        "event_json": json.dumps(details or {}, ensure_ascii=False),
+        "created_at": now_ms(),
+    }
+    event_payload["total_tokens"] = event_payload["prompt_tokens"] + event_payload["completion_tokens"]
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO usage_events (
+                id, conversation_id, user_id, provider, model, modality, metric_type,
+                prompt_tokens, completion_tokens, total_tokens,
+                estimated_prompt_tokens, estimated_completion_tokens,
+                audio_ms, speech_ms, audio_chunks, tts_chars, tts_audio_ms,
+                image_count, event_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_payload["id"],
+                event_payload["conversation_id"],
+                event_payload["user_id"],
+                event_payload["provider"],
+                event_payload["model"],
+                event_payload["modality"],
+                event_payload["metric_type"],
+                event_payload["prompt_tokens"],
+                event_payload["completion_tokens"],
+                event_payload["total_tokens"],
+                event_payload["estimated_prompt_tokens"],
+                event_payload["estimated_completion_tokens"],
+                event_payload["audio_ms"],
+                event_payload["speech_ms"],
+                event_payload["audio_chunks"],
+                event_payload["tts_chars"],
+                event_payload["tts_audio_ms"],
+                event_payload["image_count"],
+                event_payload["event_json"],
+                event_payload["created_at"],
+            ),
+        )
+
+
+def list_usage_stats(user_id: str, days: int = 7) -> dict[str, Any]:
+    safe_days = max(1, min(days, 90))
+    end = now_ms()
+    start = end - safe_days * 24 * 60 * 60 * 1000
+    with connect() as connection:
+        totals = dict(
+            connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS event_count,
+                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    COALESCE(SUM(estimated_prompt_tokens), 0) AS estimated_prompt_tokens,
+                    COALESCE(SUM(estimated_completion_tokens), 0) AS estimated_completion_tokens,
+                    COALESCE(SUM(audio_ms), 0) AS audio_ms,
+                    COALESCE(SUM(speech_ms), 0) AS speech_ms,
+                    COALESCE(SUM(audio_chunks), 0) AS audio_chunks,
+                    COALESCE(SUM(tts_chars), 0) AS tts_chars,
+                    COALESCE(SUM(tts_audio_ms), 0) AS tts_audio_ms,
+                    COALESCE(SUM(image_count), 0) AS image_count
+                FROM usage_events
+                WHERE user_id = ? AND created_at >= ?
+                """,
+                (user_id, start),
+            ).fetchone()
+        )
+        modality_rows = connection.execute(
+            """
+            SELECT
+                modality,
+                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                COALESCE(SUM(estimated_prompt_tokens), 0) AS estimated_prompt_tokens,
+                COALESCE(SUM(estimated_completion_tokens), 0) AS estimated_completion_tokens,
+                COALESCE(SUM(audio_ms), 0) AS audio_ms,
+                COALESCE(SUM(speech_ms), 0) AS speech_ms,
+                COALESCE(SUM(tts_chars), 0) AS tts_chars,
+                COALESCE(SUM(tts_audio_ms), 0) AS tts_audio_ms,
+                COALESCE(SUM(image_count), 0) AS image_count,
+                COUNT(*) AS event_count
+            FROM usage_events
+            WHERE user_id = ? AND created_at >= ?
+            GROUP BY modality
+            ORDER BY event_count DESC
+            """,
+            (user_id, start),
+        ).fetchall()
+        conversation_rows = connection.execute(
+            """
+            SELECT
+                c.id,
+                c.title,
+                MAX(u.created_at) AS last_used_at,
+                COALESCE(SUM(u.prompt_tokens), 0) AS prompt_tokens,
+                COALESCE(SUM(u.completion_tokens), 0) AS completion_tokens,
+                COALESCE(SUM(u.estimated_prompt_tokens), 0) AS estimated_prompt_tokens,
+                COALESCE(SUM(u.estimated_completion_tokens), 0) AS estimated_completion_tokens,
+                COALESCE(SUM(u.audio_ms), 0) AS audio_ms,
+                COALESCE(SUM(u.speech_ms), 0) AS speech_ms,
+                COALESCE(SUM(u.tts_chars), 0) AS tts_chars,
+                COALESCE(SUM(u.tts_audio_ms), 0) AS tts_audio_ms,
+                COALESCE(SUM(u.image_count), 0) AS image_count,
+                COUNT(u.id) AS event_count
+            FROM usage_events u
+            JOIN conversations c ON c.id = u.conversation_id AND c.user_id = u.user_id
+            WHERE u.user_id = ? AND u.created_at >= ?
+            GROUP BY c.id
+            ORDER BY last_used_at DESC
+            LIMIT 8
+            """,
+            (user_id, start),
+        ).fetchall()
+        recent_rows = connection.execute(
+            """
+            SELECT provider, model, modality, metric_type, prompt_tokens, completion_tokens,
+                   estimated_prompt_tokens, estimated_completion_tokens, audio_ms, speech_ms,
+                   tts_chars, tts_audio_ms, image_count, created_at
+            FROM usage_events
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT 12
+            """,
+            (user_id,),
+        ).fetchall()
+
+    totals["estimated_units"] = estimate_units_from_usage(totals)
+    return {
+        "period_start": start,
+        "period_end": end,
+        "generated_at": end,
+        "days": safe_days,
+        "totals": totals,
+        "modalities": [decorate_usage_bucket(dict(row)) for row in modality_rows],
+        "conversations": [decorate_usage_bucket(dict(row)) for row in conversation_rows],
+        "recent_events": [dict(row) for row in recent_rows],
+    }
+
+
+def estimate_units_from_usage(usage: dict[str, Any]) -> float:
+    prompt_tokens = int(usage.get("prompt_tokens") or usage.get("estimated_prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or usage.get("estimated_completion_tokens") or 0)
+    speech_ms = int(usage.get("speech_ms") or usage.get("audio_ms") or 0)
+    image_count = int(usage.get("image_count") or 0)
+    tts_chars = int(usage.get("tts_chars") or 0)
+    return round(speech_ms / 60000 * 1.0 + image_count * 4.0 + (prompt_tokens + completion_tokens) / 1000 + tts_chars / 1000 * 0.3, 2)
+
+
+def decorate_usage_bucket(row: dict[str, Any]) -> dict[str, Any]:
+    row["estimated_units"] = estimate_units_from_usage(row)
+    return row
 
 
 def touch_conversation(connection: sqlite3.Connection, user_id: str, conversation_id: str, updated_at: int) -> None:

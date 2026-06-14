@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from contextlib import suppress
 from typing import Any
 
@@ -9,7 +10,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from .ai import frame_hash
 from .conversation_pipeline import ConversationPipeline, pipecat_runtime_status
-from .db import append_message, save_cost_snapshot
+from .db import append_message, enqueue_usage_event, save_cost_snapshot
 from .model_config import runtime_model_config_for_user
 from .models import FrameSnapshot, SessionState, event, now_ms
 from .realtime import QwenRealtimeProvider, realtime_available
@@ -70,6 +71,7 @@ class GatewayConnection:
         except WebSocketDisconnect:
             await self.cancel_generation(silent=True)
         finally:
+            self.record_pending_stt_usage()
             if self.realtime:
                 await self.realtime.close()
 
@@ -104,10 +106,7 @@ class GatewayConnection:
     async def handle_audio_chunk(self, message: dict[str, Any]) -> None:
         duration_ms = int(message.get("durationMs", 0) or 0)
         rms = float(message.get("rms", 0.0) or 0.0)
-        self.session.cost.audio_chunks += 1
-        self.session.cost.audio_ms += max(0, min(duration_ms, 200))
-        if rms > 0.012:
-            self.session.cost.speech_ms += max(0, min(duration_ms, 200))
+        self.session.cost.record_audio_chunk(duration_ms, rms > 0.012)
         if self.realtime:
             audio = str(message.get("audio", ""))
             if audio:
@@ -116,6 +115,7 @@ class GatewayConnection:
                 except Exception as exc:
                     await self.send("error", code="realtime_audio_failed", message=str(exc))
         if self.session.cost.audio_chunks % 25 == 0:
+            self.record_pending_stt_usage()
             await self.send_cost()
 
     async def handle_vision_frame(self, message: dict[str, Any]) -> None:
@@ -138,6 +138,8 @@ class GatewayConnection:
                 frame for frame in self.session.recent_frames if frame.captured_at >= cutoff
             ][-4:]
             if self.realtime:
+                self.session.cost.vision_frames += 1
+                self.record_vlm_frame_usage(reason)
                 try:
                     await self.realtime.append_image(data_url)
                 except Exception as exc:
@@ -195,6 +197,8 @@ class GatewayConnection:
     async def send_provider_event(self, event_type: str, payload: Any) -> None:
         data = payload if isinstance(payload, dict) else {}
         await self.send(event_type, **data)
+        if event_type == "response.audio.delta":
+            self.record_realtime_tts_audio_usage(str(data.get("audio", "")), int(data.get("sampleRate", 24000) or 24000))
         if event_type == "llm.done" or event_type == "response.audio.done":
             await self.send_cost()
 
@@ -217,6 +221,8 @@ class GatewayConnection:
             async for pipeline_event in self.pipeline.run_user_turn(user_text):
                 if pipeline_event.type == "llm.delta":
                     answer_parts.append(str(pipeline_event.payload.get("delta", "")))
+                if pipeline_event.type == "tts.audio.chunk":
+                    self.record_tts_text_usage(str(pipeline_event.payload.get("text", "")), "browser-speech")
                 await self.send(pipeline_event.type, **pipeline_event.payload)
             answer = "".join(answer_parts).strip()
             if answer:
@@ -226,3 +232,76 @@ class GatewayConnection:
         except Exception as exc:
             await self.send("error", code="generation_failed", message=str(exc))
             await self.send("llm.done", cancelled=True)
+
+    def usage_provider(self) -> str:
+        if self.realtime:
+            return "qwen-realtime"
+        return "direct-chat-completions"
+
+    def usage_model(self) -> str:
+        if self.realtime:
+            return str(self.session.model_config.realtime_model) if self.session.model_config else "qwen-omni-realtime"
+        return str(self.session.model_config.chat_model) if self.session.model_config else "direct-model"
+
+    def record_pending_stt_usage(self) -> None:
+        usage = self.session.cost.consume_pending_audio_usage()
+        if usage["audio_ms"] <= 0 and usage["audio_chunks"] <= 0:
+            return
+        enqueue_usage_event(
+            self.session.user_id,
+            self.session.conversation_id,
+            provider="browser-capture",
+            model="microphone-stream",
+            modality="stt",
+            metric_type="audio_duration",
+            audio_ms=usage["audio_ms"],
+            speech_ms=usage["speech_ms"],
+            audio_chunks=usage["audio_chunks"],
+        )
+
+    def record_tts_text_usage(self, text: str, provider: str) -> None:
+        chars = len(text.strip())
+        if chars <= 0:
+            return
+        enqueue_usage_event(
+            self.session.user_id,
+            self.session.conversation_id,
+            provider=provider,
+            model="browser-speech-synthesis",
+            modality="tts",
+            metric_type="text_characters",
+            tts_chars=chars,
+        )
+
+    def record_realtime_tts_audio_usage(self, audio_base64: str, sample_rate: int) -> None:
+        if not audio_base64 or sample_rate <= 0:
+            return
+        try:
+            pcm_bytes = base64.b64decode(audio_base64, validate=False)
+        except Exception:
+            return
+        audio_ms = int(len(pcm_bytes) / 2 / sample_rate * 1000)
+        if audio_ms <= 0:
+            return
+        self.session.cost.tts_audio_ms += audio_ms
+        enqueue_usage_event(
+            self.session.user_id,
+            self.session.conversation_id,
+            provider=self.usage_provider(),
+            model=self.usage_model(),
+            modality="tts",
+            metric_type="audio_duration",
+            tts_audio_ms=audio_ms,
+        )
+
+    def record_vlm_frame_usage(self, reason: str) -> None:
+        enqueue_usage_event(
+            self.session.user_id,
+            self.session.conversation_id,
+            provider=self.usage_provider(),
+            model=self.usage_model(),
+            modality="vlm",
+            metric_type="image_input",
+            image_count=1,
+            details={"reason": reason},
+        )

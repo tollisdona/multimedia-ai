@@ -36,6 +36,7 @@ import {
   fetchConversations,
   fetchCurrentUser,
   fetchModelConfig,
+  fetchUsageStats,
   loadStoredAuth,
   loginUser,
   registerUser,
@@ -47,6 +48,10 @@ import {
   type ModelConfigUpdate,
   type PersistedConversation,
   type PersistedMessage,
+  type UsageBucket,
+  type UsageEvent,
+  type UsageStats,
+  type UsageTotals,
 } from "./lib/api";
 import { GatewayClient } from "./lib/wsClient";
 import type { ChatMessage, CostSnapshot, GatewayEvent, VadSnapshot } from "./types";
@@ -1208,7 +1213,15 @@ export function App() {
               />
             )}
             {activeView === "cost" && (
-              <CostStation cost={cost} connectionState={connectionState} permissionStatus={permissionStatus} asrStatus={asrStatus} realtimeAudio={realtimeAudio} />
+              <CostStation
+                apiBaseUrl={apiBaseUrl}
+                cost={cost}
+                connectionState={connectionState}
+                permissionStatus={permissionStatus}
+                asrStatus={asrStatus}
+                realtimeAudio={realtimeAudio}
+                token={authSession.accessToken}
+              />
             )}
             {activeView === "apiKeys" && (
               <ApiKeyManagementView apiBaseUrl={apiBaseUrl} token={authSession.accessToken} />
@@ -2172,30 +2185,155 @@ function ApiKeyManagementView({ apiBaseUrl, token }: { apiBaseUrl: string; token
   );
 }
 
-function CostStation({ cost, connectionState, permissionStatus, asrStatus, realtimeAudio }: { cost: CostSnapshot; connectionState: string; permissionStatus: string; asrStatus: string; realtimeAudio: boolean }) {
+const usageWindows = [7, 30, 90] as const;
+const modalityLabels: Record<string, string> = {
+  llm: "LLM 文本",
+  vlm: "VLM 视觉",
+  stt: "STT 语音",
+  tts: "TTS 语音",
+};
+
+function CostStation({
+  apiBaseUrl,
+  cost,
+  connectionState,
+  permissionStatus,
+  asrStatus,
+  realtimeAudio,
+  token,
+}: {
+  apiBaseUrl: string;
+  cost: CostSnapshot;
+  connectionState: string;
+  permissionStatus: string;
+  asrStatus: string;
+  realtimeAudio: boolean;
+  token: string;
+}) {
+  const [days, setDays] = useState<(typeof usageWindows)[number]>(7);
+  const [stats, setStats] = useState<UsageStats | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const loadStats = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setStats(await fetchUsageStats(apiBaseUrl, token, days));
+    } catch (statsError) {
+      setError(statsError instanceof Error ? statsError.message : "用量统计加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [apiBaseUrl, days, token]);
+
+  useEffect(() => {
+    void loadStats();
+  }, [loadStats]);
+
+  const totals = stats?.totals ?? emptyUsageTotals();
+  const actualTokens = totals.promptTokens + totals.completionTokens;
+  const estimatedTokens = totals.estimatedPromptTokens + totals.estimatedCompletionTokens;
+  const currentInputTokens = cost.llmInputTokens || cost.llmInputTokensEst;
+  const currentOutputTokens = cost.llmOutputTokens || cost.llmOutputTokensEst;
+
   return (
     <section className="space-y-6">
       <div className="rounded-[2rem] bg-slate-950 p-8 text-white shadow-soft">
         <span className="text-sm font-bold text-cyan-300">Gateway & Backend</span>
         <div className="mt-2 flex items-end justify-between gap-4">
           <div>
-            <h2 className="text-3xl font-black">模型消耗中转站</h2>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">集中观察 ASR、视觉关键帧、模型 token、TTS 字符和缓存命中。</p>
+            <h2 className="text-3xl font-black">模型消耗统计</h2>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">
+              当前会话实时快照与数据库聚合统计并行展示，方便复盘多模态调用成本。
+            </p>
           </div>
-          <strong className="text-6xl font-black">{cost.estimatedUnits}</strong>
+          <strong className="text-6xl font-black">{formatCompact(totals.estimatedUnits || cost.estimatedUnits)}</strong>
         </div>
       </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap gap-2">
+          {usageWindows.map((windowDays) => (
+            <button
+              className={cx(
+                "h-10 rounded-2xl border px-4 text-sm font-black transition",
+                days === windowDays
+                  ? "border-slate-950 bg-slate-950 text-white"
+                  : "border-slate-200 bg-white text-slate-600 hover:border-slate-400",
+              )}
+              key={windowDays}
+              onClick={() => setDays(windowDays)}
+              type="button"
+            >
+              {windowDays} 天
+            </button>
+          ))}
+        </div>
+        <button
+          className="inline-flex h-10 items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-black text-slate-700 hover:border-slate-400 disabled:opacity-50"
+          disabled={loading}
+          onClick={() => void loadStats()}
+          type="button"
+        >
+          <RefreshCw size={16} /> {loading ? "刷新中" : "刷新"}
+        </button>
+      </div>
+      {error && <p className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{error}</p>}
+
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <Metric label="聚合计费单位" value={formatCompact(totals.estimatedUnits)} />
+        <Metric label="真实 token" value={formatCompact(actualTokens)} />
+        <Metric label="估算 token" value={formatCompact(estimatedTokens)} />
+        <Metric label="事件数" value={formatCompact(totals.eventCount)} />
+      </div>
+
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <Metric label="音频总时长" value={`${cost.audioSeconds}s`} />
         <Metric label="有效语音" value={`${cost.speechSeconds}s`} />
         <Metric label="音频帧" value={cost.audioChunks.toString()} />
         <Metric label="视觉调用" value={cost.visionFrames.toString()} />
         <Metric label="缓存命中" value={cost.visionCacheHits.toString()} />
-        <Metric label="输入 token 估算" value={cost.llmInputTokensEst.toString()} />
-        <Metric label="输出 token 估算" value={cost.llmOutputTokensEst.toString()} />
+        <Metric label="输入 token" value={formatCompact(currentInputTokens)} />
+        <Metric label="输出 token" value={formatCompact(currentOutputTokens)} />
         <Metric label="TTS 字符" value={cost.ttsChars.toString()} />
         <Metric label="打断次数" value={cost.interruptions.toString()} />
       </div>
+
+      <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
+        <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+          <h3 className="mb-4 text-sm font-black text-slate-900">按模态聚合</h3>
+          <div className="space-y-4">
+            {stats?.modalities.length ? (
+              stats.modalities.map((bucket) => <ModalityUsageBar bucket={bucket} key={bucket.modality} maxUnits={maxBucketUnits(stats.modalities)} />)
+            ) : (
+              <EmptyUsageState text="暂无聚合事件。完成一次对话后这里会出现 STT、VLM、LLM 与 TTS 记录。" />
+            )}
+          </div>
+        </section>
+        <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+          <h3 className="mb-4 text-sm font-black text-slate-900">最近事件</h3>
+          <div className="divide-y divide-slate-100">
+            {stats?.recentEvents.length ? (
+              stats.recentEvents.slice(0, 6).map((event, index) => <RecentUsageEvent event={event} key={`${event.createdAt}-${index}`} />)
+            ) : (
+              <EmptyUsageState text="暂无事件记录。" />
+            )}
+          </div>
+        </section>
+      </div>
+
+      <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+        <h3 className="mb-4 text-sm font-black text-slate-900">会话用量</h3>
+        <div className="divide-y divide-slate-100">
+          {stats?.conversations.length ? (
+            stats.conversations.map((conversation) => <ConversationUsageRow conversation={conversation} key={conversation.id} />)
+          ) : (
+            <EmptyUsageState text="这个时间窗口内还没有会话用量。" />
+          )}
+        </div>
+      </section>
+
       <div className="grid gap-3 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm md:grid-cols-2">
         <PipelineItem icon={<Wifi size={16} />} label={`Gateway：${connectionState}`} />
         <PipelineItem icon={<Camera size={16} />} label={`权限：${permissionStatus}`} />
@@ -2205,6 +2343,97 @@ function CostStation({ cost, connectionState, permissionStatus, asrStatus, realt
       </div>
     </section>
   );
+}
+
+function emptyUsageTotals(): UsageTotals {
+  return {
+    eventCount: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    estimatedPromptTokens: 0,
+    estimatedCompletionTokens: 0,
+    audioMs: 0,
+    speechMs: 0,
+    audioChunks: 0,
+    ttsChars: 0,
+    ttsAudioMs: 0,
+    imageCount: 0,
+    estimatedUnits: 0,
+  };
+}
+
+function formatCompact(value: number) {
+  return Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1, notation: Math.abs(value) >= 10000 ? "compact" : "standard" }).format(value);
+}
+
+function formatDuration(ms: number) {
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  return `${(seconds / 60).toFixed(1)}min`;
+}
+
+function maxBucketUnits(buckets: UsageBucket[]) {
+  return Math.max(0, ...buckets.map((bucket) => bucket.estimatedUnits));
+}
+
+function ModalityUsageBar({ bucket, maxUnits }: { bucket: UsageBucket; maxUnits: number }) {
+  const width = maxUnits > 0 ? Math.max(5, Math.round((bucket.estimatedUnits / maxUnits) * 100)) : 0;
+  const tokens = bucket.promptTokens + bucket.completionTokens || bucket.estimatedPromptTokens + bucket.estimatedCompletionTokens;
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <span className="text-sm font-black text-slate-900">{modalityLabels[bucket.modality ?? ""] ?? bucket.modality}</span>
+        <span className="text-xs font-bold text-slate-500">
+          {formatCompact(bucket.estimatedUnits)} units · {formatCompact(tokens)} token
+        </span>
+      </div>
+      <div className="h-3 rounded bg-slate-100">
+        <div className="h-3 rounded bg-slate-950" style={{ width: `${width}%` }} />
+      </div>
+      <div className="mt-2 text-xs font-semibold text-slate-500">
+        图片 {bucket.imageCount} · 音频 {formatDuration(bucket.audioMs)} · TTS {formatCompact(bucket.ttsChars)} 字
+      </div>
+    </div>
+  );
+}
+
+function RecentUsageEvent({ event }: { event: UsageEvent }) {
+  const tokens = event.promptTokens + event.completionTokens || event.estimatedPromptTokens + event.estimatedCompletionTokens;
+  return (
+    <div className="grid grid-cols-[1fr_auto] gap-3 py-3">
+      <span className="min-w-0">
+        <span className="block truncate text-sm font-black text-slate-900">{modalityLabels[event.modality] ?? event.modality}</span>
+        <span className="block truncate text-xs font-semibold text-slate-500">
+          {event.metricType} · {event.model || event.provider}
+        </span>
+      </span>
+      <span className="text-right text-xs font-bold text-slate-500">
+        <strong className="block text-sm font-black text-slate-950">{tokens ? `${formatCompact(tokens)} token` : formatDuration(event.audioMs || event.ttsAudioMs)}</strong>
+        {timeLabel(event.createdAt)}
+      </span>
+    </div>
+  );
+}
+
+function ConversationUsageRow({ conversation }: { conversation: UsageBucket }) {
+  const tokens = conversation.promptTokens + conversation.completionTokens || conversation.estimatedPromptTokens + conversation.estimatedCompletionTokens;
+  return (
+    <div className="grid gap-2 py-3 text-sm md:grid-cols-[1.4fr_0.8fr_0.8fr_0.8fr] md:items-center">
+      <span className="min-w-0">
+        <span className="block truncate font-black text-slate-950">{conversation.title ?? "未命名会话"}</span>
+        <span className="block text-xs font-semibold text-slate-500">{conversation.lastUsedAt ? timeLabel(conversation.lastUsedAt) : "暂无时间"}</span>
+      </span>
+      <span className="font-bold text-slate-600">事件 {formatCompact(conversation.eventCount)}</span>
+      <span className="font-bold text-slate-600">Token {formatCompact(tokens)}</span>
+      <span className="font-black text-slate-950">{formatCompact(conversation.estimatedUnits)} units</span>
+    </div>
+  );
+}
+
+function EmptyUsageState({ text }: { text: string }) {
+  return <p className="rounded-2xl bg-slate-50 px-4 py-6 text-sm font-bold text-slate-500">{text}</p>;
 }
 
 function SettingsView({
